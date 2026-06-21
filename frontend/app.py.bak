@@ -1,0 +1,3186 @@
+import streamlit as st
+import cv2
+import numpy as np
+import time
+from datetime import datetime, timedelta
+from PIL import Image
+from utils.api_client import FaceAiApiClient
+import base64
+from io import BytesIO
+from pathlib import Path
+import logging
+
+logger = logging.getLogger("faceai.app")
+
+def generate_audit_pdf(audit_logs):
+    from fpdf import FPDF
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("helvetica", size=12)
+    
+    # Title
+    pdf.set_font("helvetica", "B", 16)
+    pdf.cell(200, 10, text="System Audit Logs Report", ln=1, align="C")
+    pdf.ln(10)
+    
+    # Table headers
+    pdf.set_font("helvetica", "B", 10)
+    col_width = [15, 20, 95, 25, 35]
+    headers = ["ID", "Admin ID", "Action", "Target ID", "Timestamp"]
+    for i in range(len(headers)):
+        pdf.cell(col_width[i], 10, headers[i], border=1)
+    pdf.ln()
+    
+    # Table rows
+    pdf.set_font("helvetica", size=9)
+    for log in audit_logs:
+        log_id = str(log.get("id", ""))
+        admin_id = str(log.get("admin_id", ""))
+        action = str(log.get("action", ""))
+        target_id = str(log.get("target_user_id", ""))
+        if target_id == "None" or not target_id:
+            target_id = "N/A"
+        timestamp = str(log.get("timestamp", ""))
+        
+        if len(action) > 50:
+            action = action[:47] + "..."
+            
+        pdf.cell(col_width[0], 8, log_id, border=1)
+        pdf.cell(col_width[1], 8, admin_id, border=1)
+        pdf.cell(col_width[2], 8, action, border=1)
+        pdf.cell(col_width[3], 8, target_id, border=1)
+        pdf.cell(col_width[4], 8, timestamp, border=1)
+        pdf.ln()
+        
+    return bytes(pdf.output())
+
+# Initialize API client inside session state to persist credentials across page reruns
+if "api" not in st.session_state:
+    st.session_state.api = FaceAiApiClient("http://127.0.0.1:8000")
+api = st.session_state.api
+
+# Session Inactivity Timeout (15 minutes = 900 seconds)
+if st.session_state.get("authenticated") and st.session_state.get("user_id"):
+    import time
+    current_time = time.time()
+    last_activity = st.session_state.get("last_activity")
+    if last_activity is not None and (current_time - last_activity) > 900:
+        st.session_state.authenticated = False
+        st.session_state.user_role = None
+        st.session_state.username = ""
+        st.session_state.user_id = None
+        st.session_state.approval_status = None
+        st.session_state.current_page = "Home / Scanner"
+        api.clear_token()
+        st.sidebar.error("⚠️ Session expired due to inactivity. Please log in again.")
+    st.session_state.last_activity = current_time
+
+
+
+# Camera memory management: Release camera if we navigated away from the scanner page
+if "camera" in st.session_state and st.session_state.camera is not None:
+    # If the user changed the sidebar navigation, the page tracker changes
+    if st.session_state.get("current_page") not in ["Home / Scanner", "Scanner", "Live Attendance Scanner"]:
+        st.session_state.camera.release()
+        st.session_state.camera = None
+        st.session_state.scanning = False
+
+
+def draw_face_overlay(frame, x1, y1, x2, y2, name, user_id, status_det):
+    # Select color based on status (BGR format)
+    if status_det == "recognized":
+        box_color = (0, 255, 0)      # Green for checked-in
+        status_text = ""
+    elif status_det in ["already_marked", "ask_leave"]:
+        box_color = (255, 255, 0)    # Cyan for already marked/leaving
+        status_text = " (MARKED)"
+    elif status_det == "not_approved":
+        box_color = (0, 165, 255)    # Orange for pending approval
+        status_text = " (PENDING)"
+    else:
+        box_color = (0, 0, 255)      # Red for unknown
+        status_text = ""
+
+    # Draw bounding box around face
+    cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
+    
+    # Format labels
+    label_name = name.upper()
+    if status_text:
+        label_name += status_text
+        
+    student_id = f"STU{100 + user_id}" if (user_id and user_id > 0) else None
+    
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale_name = 0.55
+    scale_id = 0.45
+    thick_name = 2
+    thick_id = 1
+    
+    (w_name, h_name), _ = cv2.getTextSize(label_name, font, scale_name, thick_name)
+    if student_id:
+        (w_id, h_id), _ = cv2.getTextSize(f"ID: {student_id}", font, scale_id, thick_id)
+        label_w = max(w_name, w_id) + 16
+        label_h = h_name + h_id + 18
+    else:
+        label_w = w_name + 16
+        label_h = h_name + 12
+        
+    # Place label ABOVE the bounding box
+    lx1 = x1 + (x2 - x1 - label_w) // 2
+    ly1 = y1 - label_h - 6
+    
+    # Fallback to drawing BELOW if it goes above the frame boundary
+    if ly1 < 5:
+        ly1 = y2 + 6
+        
+    lx2 = lx1 + label_w
+    ly2 = ly1 + label_h
+    
+    # Clip coordinates to frame size
+    fh, fw, _ = frame.shape
+    lx1 = max(0, min(lx1, fw - 1))
+    lx2 = max(0, min(lx2, fw - 1))
+    ly1 = max(0, min(ly1, fh - 1))
+    ly2 = max(0, min(ly2, fh - 1))
+    
+    # Translucent background capsule drawing
+    if lx2 > lx1 and ly2 > ly1:
+        overlay = frame.copy()
+        # Draw background
+        if status_det == "recognized":
+            bg_color = (0, 45, 0)
+        elif status_det in ["already_marked", "ask_leave"]:
+            bg_color = (45, 45, 0)
+        elif status_det == "not_approved":
+            bg_color = (0, 30, 45)
+        else:
+            bg_color = (0, 0, 45)
+            
+        cv2.rectangle(overlay, (lx1, ly1), (lx2, ly2), bg_color, -1)
+        cv2.rectangle(overlay, (lx1, ly1), (lx2, ly2), box_color, 1)
+        
+        # Apply overlay with alpha blend
+        alpha = 0.7
+        cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+        
+        # Draw text on blended frame
+        ty1 = ly1 + h_name + 6
+        cv2.putText(frame, label_name, (lx1 + 8, ty1), font, scale_name, (255, 255, 255), thick_name, cv2.LINE_AA)
+        
+        if student_id:
+            ty2 = ty1 + h_id + 8
+            cv2.putText(frame, f"ID: {student_id}", (lx1 + 8, ty2), font, scale_id, (200, 200, 200), thick_id, cv2.LINE_AA)
+
+# Page Configuration
+st.set_page_config(
+    page_title="Face AI Attendance System",
+    page_icon="📷",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Custom Premium White & Black High-Contrast Styling
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap');
+    
+    html, body, [class*="css"] {
+        font-family: 'Inter', sans-serif;
+        overflow-x: hidden !important;
+    }
+    
+    .stApp,
+    [data-testid="stAppViewContainer"],
+    [data-testid="stHeader"],
+    .main,
+    .stMain,
+    .stAppViewContainer,
+    div[data-testid="stAppViewBlockContainer"] {
+        background-color: #FFFFFF !important;
+        background-image: none !important;
+        color: #1F2937 !important;
+    }
+
+    [data-testid="stHeader"] * {
+        color: #1F2937 !important;
+        fill: #1F2937 !important;
+    }
+    
+    /* Header Card styling */
+    .main-header {
+        background: #2563EB !important;
+        padding: 2rem !important;
+        border-radius: 12px !important;
+        color: #FFFFFF !important;
+        text-align: center !important;
+        margin-bottom: 2rem !important;
+        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15) !important;
+        border: 1px solid #FFFFFF !important;
+    }
+    
+    .main-header h1 {
+        font-family: 'Outfit', sans-serif !important;
+        margin: 0 !important;
+        font-weight: 800 !important;
+        font-size: 2.4rem !important;
+        color: #FFFFFF !important;
+    }
+    
+    .main-header p {
+        margin: 8px 0 0 0 !important;
+        font-size: 1.1rem !important;
+        opacity: 0.95 !important;
+        font-weight: 400 !important;
+        color: #FFFFFF !important;
+    }
+    
+    /* Section Headers */
+    h1, h2, h3, h4, h5, h6 {
+        font-family: 'Outfit', sans-serif !important;
+        color: #1F2937 !important;
+        font-weight: 700 !important;
+    }
+    
+    /* Metrics blocks */
+    .metric-card {
+        background-color: #FFFFFF !important;
+        padding: 1.5rem !important;
+        border-radius: 10px !important;
+        border: 1px solid #60A5FA !important;
+        border-left: 6px solid #2563EB !important;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05) !important;
+        margin-bottom: 1rem !important;
+    }
+    
+    .stat-number {
+        font-family: 'Outfit', sans-serif !important;
+        font-size: 2.2rem !important;
+        font-weight: 800 !important;
+        color: #1F2937 !important;
+        margin: 0 0 4px 0 !important;
+    }
+    
+    .stat-label {
+        font-family: 'Outfit', sans-serif !important;
+        font-size: 0.85rem !important;
+        color: #1F2937 !important;
+        text-transform: uppercase !important;
+        font-weight: 700 !important;
+        margin: 0 !important;
+    }
+    
+    /* Button overrides are moved to the end of the stylesheet to ensure they take precedence over all container rules */
+    
+    /* Sidebar customization (white background -> black text) */
+    [data-testid="stSidebar"],
+    [data-testid="stSidebarUserContent"],
+    div[data-testid="stSidebarCollapseButton"] {
+        background-color: #FFFFFF !important;
+        border-right: 1px solid #60A5FA !important;
+        color: #1F2937 !important;
+    }
+    
+    [data-testid="stSidebar"] * {
+        color: #1F2937 !important;
+    }
+    
+    [data-testid="stSidebar"] button {
+        background-color: #2563EB !important;
+        color: #FFFFFF !important;
+        border: 1px solid #60A5FA !important;
+    }
+    
+    [data-testid="stSidebar"] button * {
+        color: #FFFFFF !important;
+        background-color: transparent !important;
+        border: none !important;
+        box-shadow: none !important;
+    }
+    
+    [data-testid="stSidebar"] button:hover {
+        background-color: #FFFFFF !important;
+        color: #1F2937 !important;
+        border: 1px solid #60A5FA !important;
+    }
+    
+    [data-testid="stSidebar"] button:hover * {
+        color: #1F2937 !important;
+    }
+    
+    /* Cards and content blocks */
+    .content-box {
+        background-color: #FFFFFF !important;
+        padding: 1.8rem !important;
+        border-radius: 10px !important;
+        border: 1px solid #60A5FA !important;
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05) !important;
+        margin-bottom: 1.5rem !important;
+        color: #1F2937 !important;
+    }
+    
+    /* Verification Statuses */
+    .status-badge {
+        padding: 6px 14px !important;
+        border-radius: 20px !important;
+        font-weight: 700 !important;
+        font-size: 0.85rem !important;
+        display: inline-block !important;
+        border: 1px solid #60A5FA !important;
+    }
+    
+    .status-pending {
+        background-color: #FFFFFF !important;
+        color: #1F2937 !important;
+    }
+    
+    .status-approved {
+        background-color: #28a745 !important;
+        color: #FFFFFF !important;
+        border-color: #28a745 !important;
+    }
+    
+    .status-rejected {
+        background-color: #FFFFFF !important;
+        color: #1F2937 !important;
+        border: 1px dashed #60A5FA !important;
+    }
+
+    /* Force input widget labels and input texts to be clearly visible */
+    div[data-testid="stWidgetLabel"] p, label, .stWidgetLabel p {
+        color: #1F2937 !important;
+        font-weight: 700 !important;
+        font-size: 0.95rem !important;
+    }
+    
+    div[data-baseweb="input"] {
+        background-color: #FFFFFF !important;
+        border: 1px solid #60A5FA !important;
+        border-radius: 8px !important;
+    }
+    
+    div[data-baseweb="input"] input {
+        color: #1F2937 !important;
+        background-color: transparent !important;
+        -webkit-text-fill-color: #1F2937 !important;
+        text-transform: none !important;
+    }
+    
+    div[data-baseweb="input"]:focus-within {
+        border-color: #2563EB !important;
+        box-shadow: 0 0 0 1px #2563EB !important;
+    }
+    
+    div[data-baseweb="select"] > div {
+        background-color: #FFFFFF !important;
+        border: 1px solid #60A5FA !important;
+        border-radius: 8px !important;
+    }
+    
+    div[data-baseweb="select"] * {
+        color: #1F2937 !important;
+    }
+    
+    div[data-baseweb="select"] > div:focus-within {
+        border-color: #2563EB !important;
+        box-shadow: 0 0 0 1px #2563EB !important;
+    }
+    
+    /* Style base web select dropdown list menu */
+    div[role="listbox"] {
+        background-color: #FFFFFF !important;
+        border: 1px solid #60A5FA !important;
+    }
+    div[role="listbox"] * {
+        color: #1F2937 !important;
+        background-color: #FFFFFF !important;
+    }
+    div[role="listbox"] li:hover {
+        background-color: #2563EB !important;
+        color: #FFFFFF !important;
+    }
+    div[role="listbox"] li:hover * {
+        background-color: #2563EB !important;
+        color: #FFFFFF !important;
+    }
+    
+    /* Placeholder styling */
+    ::placeholder {
+        color: #666666 !important;
+        opacity: 1 !important;
+    }
+    :-ms-input-placeholder {
+        color: #666666 !important;
+    }
+    ::-ms-input-placeholder {
+        color: #666666 !important;
+    }
+
+    /* Style the border container and ensure it is white in all Streamlit emotion cache variants */
+    div[data-testid="stVerticalBlockBorder"],
+    div.stVerticalBlockBorder,
+    [data-testid="stVerticalBlock"] > div[style*="border"],
+    .st-emotion-cache-12w0qpk,
+    .st-emotion-cache-1y4p8pa {
+        background-color: #FFFFFF !important;
+        padding: 1.8rem !important;
+        border-radius: 10px !important;
+        border: 1px solid #60A5FA !important;
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05) !important;
+        margin-bottom: 1.5rem !important;
+        color: #1F2937 !important;
+    }
+    
+    /* Enforce body text colors in markdown lists and paragraphs */
+    div[data-testid="stMarkdown"] p, div[data-testid="stMarkdown"] li {
+        color: #1F2937 !important;
+        line-height: 1.6 !important;
+    }
+
+    /* Streamlit expander text colors */
+    div[data-testid="stExpander"] {
+        background-color: #FFFFFF !important;
+        border: 1px solid #60A5FA !important;
+        border-radius: 8px !important;
+    }
+    div[data-testid="stExpander"] details summary {
+        background-color: #FFFFFF !important;
+        color: #1F2937 !important;
+    }
+    div[data-testid="stExpander"] details summary * {
+        color: #1F2937 !important;
+        font-weight: 700 !important;
+    }
+    div[data-testid="stExpander"] details div {
+        background-color: #FFFFFF !important;
+        color: #1F2937 !important;
+    }
+    div[data-testid="stExpander"] details div * {
+        color: #1F2937 !important;
+    }
+
+    /* Streamlit tabs text colors (Active: Black bg + White text, Inactive: White bg + Black text) */
+    div[data-testid="stTabs"] {
+        background-color: #FFFFFF !important;
+    }
+    button[data-baseweb="tab"] {
+        background-color: #FFFFFF !important;
+        color: #1F2937 !important;
+        border: 1px solid transparent !important;
+        transition: all 0.3s ease !important;
+    }
+    button[data-baseweb="tab"] p {
+        color: #1F2937 !important;
+        font-weight: 500 !important;
+    }
+    button[data-baseweb="tab"]:hover {
+        border-bottom: 2px solid #2563EB !important;
+    }
+    button[data-baseweb="tab"][aria-selected="true"] {
+        background-color: #2563EB !important;
+        color: #FFFFFF !important;
+        border: 1px solid #60A5FA !important;
+        border-radius: 4px 4px 0 0 !important;
+    }
+    button[data-baseweb="tab"][aria-selected="true"] p {
+        color: #FFFFFF !important;
+        font-weight: 800 !important;
+    }
+
+    /* Streamlit table alignment and readable fonts */
+    div[data-testid="stTable"] th {
+        background-color: #2563EB !important;
+        color: #FFFFFF !important;
+        font-weight: 700 !important;
+        font-family: 'Outfit', sans-serif !important;
+        border-bottom: 2px solid #2563EB !important;
+    }
+    
+    div[data-testid="stTable"] td {
+        color: #1F2937 !important;
+        border-bottom: 1px solid #60A5FA !important;
+        background-color: #FFFFFF !important;
+    }
+
+    /* Alert styling overrides to match Black & White design (white box, black text/borders) */
+    div[data-testid="stAlert"] {
+        background-color: #FFFFFF !important;
+        color: #1F2937 !important;
+        border: 1px solid #60A5FA !important;
+    }
+    div[data-testid="stAlert"] * {
+        color: #1F2937 !important;
+    }
+
+    /* Style the header container only, preventing parent blocks from turning black */
+    div[data-testid="stVerticalBlock"] div[data-testid="stVerticalBlock"]:has(#header-nav-marker) {
+        background-color: #2563EB !important; /* Pure black background */
+        background-image: none !important;
+        padding: 1.8rem !important;
+        border-radius: 12px !important;
+        color: #FFFFFF !important;
+        text-align: center !important;
+        margin-bottom: 2rem !important;
+        box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2) !important;
+        border: 1px solid #FFFFFF !important;
+    }
+
+    /* Make title inside header white */
+    div[data-testid="stVerticalBlock"] div[data-testid="stVerticalBlock"]:has(#header-nav-marker) h1 {
+        color: #FFFFFF !important;
+        text-align: center !important;
+        margin-top: 0 !important;
+        margin-bottom: 0.8rem !important;
+        font-weight: 700 !important;
+        font-size: 2.2rem !important;
+    }
+
+    /* Style buttons inside header to look premium and distinct */
+    div[data-testid="stVerticalBlock"] div[data-testid="stVerticalBlock"]:has(#header-nav-marker) button {
+        background-color: transparent !important;
+        color: #FFFFFF !important;
+        border: 1px solid transparent !important;
+        font-weight: 500 !important;
+        border-radius: 20px !important; /* Rounded pill style */
+        padding: 0.4rem 1.2rem !important;
+        transition: all 0.3s ease !important;
+        width: 100% !important;
+        box-shadow: none !important;
+        white-space: nowrap !important;
+    }
+
+    div[data-testid="stVerticalBlock"] div[data-testid="stVerticalBlock"]:has(#header-nav-marker) button:hover {
+        color: #1F2937 !important;
+        background-color: #FFFFFF !important;
+        border: 1px solid #FFFFFF !important;
+    }
+
+    /* Style the active button inside the header as a white pill with black text */
+    div[data-testid="stVerticalBlock"] div[data-testid="stVerticalBlock"]:has(#header-nav-marker) button[data-testid="baseButton-primary"] {
+        background-color: #FFFFFF !important;
+        color: #1F2937 !important;
+        font-weight: 600 !important;
+        border: 1px solid #FFFFFF !important;
+    }
+
+    div[data-testid="stVerticalBlock"] div[data-testid="stVerticalBlock"]:has(#header-nav-marker) button[data-testid="baseButton-primary"]:hover {
+        background-color: #EEEEEE !important;
+        color: #1F2937 !important;
+    }
+
+    /* Center and format the columns and prevent mobile stacking */
+    div[data-testid="stVerticalBlock"] div[data-testid="stVerticalBlock"]:has(#header-nav-marker) div[data-testid="stHorizontalBlock"] {
+        display: flex !important;
+        flex-direction: row !important;
+        flex-wrap: wrap !important;
+        justify-content: space-evenly !important;
+        align-items: center !important;
+        gap: 12px !important;
+        width: 100% !important;
+    }
+
+    div[data-testid="stVerticalBlock"] div[data-testid="stVerticalBlock"]:has(#header-nav-marker) div[data-testid="stHorizontalBlock"] > div {
+        width: auto !important;
+        flex: 1 1 auto !important;
+        max-width: max-content !important;
+        display: flex !important;
+        justify-content: center !important;
+        align-items: center !important;
+        padding: 0 !important;
+    }
+
+    /* Streamlit progress bar override to match B&W */
+    div[data-testid="stProgress"] > div {
+        background-color: #FFFFFF !important;
+        border: 1px solid #60A5FA !important;
+        height: 12px !important;
+        border-radius: 6px !important;
+    }
+    div[data-testid="stProgress"] > div > div {
+        background-color: #2563EB !important;
+        height: 10px !important;
+        border-radius: 5px !important;
+    }
+
+    /* Mobile responsiveness adjustments */
+    @media (max-width: 768px) {
+        div[data-testid="stVerticalBlock"] div[data-testid="stVerticalBlock"]:has(#header-nav-marker) h1 {
+            font-size: 1.6rem !important;
+        }
+        
+        div[data-testid="stVerticalBlock"] div[data-testid="stVerticalBlock"]:has(#header-nav-marker) button {
+            padding: 0.3rem 0.8rem !important;
+            font-size: 0.85rem !important;
+        }
+        
+        div[data-testid="stVerticalBlock"] div[data-testid="stVerticalBlock"]:has(#header-nav-marker) div[data-testid="stHorizontalBlock"] {
+            gap: 8px !important;
+            justify-content: center !important;
+        }
+    }
+
+    /* =========================================================================
+       BUTTON STYLING OVERRIDES (Placed at the end of stylesheet for highest precedence)
+       ========================================================================= */
+    /* 1. Global Button Styles */
+    div[data-testid*="Button"] button[data-testid*="baseButton"],
+    div.stButton button,
+    div.stFormSubmitButton button,
+    button[data-testid*="baseButton"] {
+        background-color: #2563EB !important;
+        background: #2563EB !important;
+        color: #FFFFFF !important;
+        font-weight: 600 !important;
+        border-radius: 12px !important;
+        border: 1px solid #60A5FA !important;
+        padding: 0.6rem 1.6rem !important;
+        transition: all 0.3s ease !important;
+        width: 100% !important;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.08) !important;
+        opacity: 1 !important;
+    }
+    
+    div[data-testid*="Button"] button[data-testid*="baseButton"]:hover,
+    div.stButton button:hover,
+    div.stFormSubmitButton button:hover,
+    button[data-testid*="baseButton"]:hover {
+        background-color: #FFFFFF !important;
+        background: #FFFFFF !important;
+        color: #1F2937 !important;
+        border: 1px solid #60A5FA !important;
+        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.2) !important;
+        transform: translateY(-1px) !important;
+    }
+
+    /* 2. Global Button Children Styles (Transparent backgrounds & White text) */
+    button[data-testid*="baseButton"] *,
+    button[data-testid*="baseButton"] * *,
+    button[data-testid*="baseButton"] p,
+    button[data-testid*="baseButton"] span,
+    button[data-testid*="baseButton"] div {
+        background-color: transparent !important;
+        background: transparent !important;
+        color: #FFFFFF !important;
+        border: none !important;
+        border-color: transparent !important;
+        box-shadow: none !important;
+        padding: 0 !important;
+        margin: 0 !important;
+    }
+    
+    button[data-testid*="baseButton"]:hover *,
+    button[data-testid*="baseButton"]:hover * *,
+    button[data-testid*="baseButton"]:hover p,
+    button[data-testid*="baseButton"]:hover span,
+    button[data-testid*="baseButton"]:hover div {
+        color: #1F2937 !important;
+        background-color: transparent !important;
+        background: transparent !important;
+        border: none !important;
+        border-color: transparent !important;
+        box-shadow: none !important;
+        padding: 0 !important;
+        margin: 0 !important;
+    }
+
+    /* 3. Expander Button Specificity Overrides */
+    div[data-testid*="expander"] div[data-testid*="Button"] button[data-testid*="baseButton"],
+    div.stExpander div.stButton button,
+    details div.stButton button,
+    div[data-testid*="expander"] button,
+    details button {
+        background-color: #2563EB !important;
+        background: #2563EB !important;
+        color: #FFFFFF !important;
+        border: 1px solid #60A5FA !important;
+        border-radius: 12px !important;
+    }
+    
+    div[data-testid*="expander"] div[data-testid*="Button"] button[data-testid*="baseButton"] *,
+    div[data-testid*="expander"] div[data-testid*="Button"] button[data-testid*="baseButton"] * *,
+    div[data-testid*="expander"] div[data-testid*="Button"] button[data-testid*="baseButton"] p,
+    div[data-testid*="expander"] div[data-testid*="Button"] button[data-testid*="baseButton"] span,
+    div[data-testid*="expander"] div[data-testid*="Button"] button[data-testid*="baseButton"] div,
+    div.stExpander div.stButton button *,
+    details div.stButton button *,
+    div[data-testid*="expander"] button *,
+    details button * {
+        background-color: transparent !important;
+        background: transparent !important;
+        color: #FFFFFF !important;
+        border: none !important;
+        border-color: transparent !important;
+        box-shadow: none !important;
+        padding: 0 !important;
+        margin: 0 !important;
+    }
+    
+    div[data-testid*="expander"] div[data-testid*="Button"] button[data-testid*="baseButton"]:hover,
+    div.stExpander div.stButton button:hover,
+    details div.stButton button:hover,
+    div[data-testid*="expander"] button:hover,
+    details button:hover {
+        background-color: #FFFFFF !important;
+        background: #FFFFFF !important;
+        color: #1F2937 !important;
+        border: 1px solid #60A5FA !important;
+    }
+    
+    div[data-testid*="expander"] div[data-testid*="Button"] button[data-testid*="baseButton"]:hover *,
+    div[data-testid*="expander"] div[data-testid*="Button"] button[data-testid*="baseButton"]:hover * *,
+    div[data-testid*="expander"] div[data-testid*="Button"] button[data-testid*="baseButton"]:hover p,
+    div[data-testid*="expander"] div[data-testid*="Button"] button[data-testid*="baseButton"]:hover span,
+    div[data-testid*="expander"] div[data-testid*="Button"] button[data-testid*="baseButton"]:hover div,
+    div.stExpander div.stButton button:hover *,
+    details div.stButton button:hover *,
+    div[data-testid*="expander"] button:hover *,
+    details button:hover * {
+        color: #1F2937 !important;
+        background-color: transparent !important;
+        background: transparent !important;
+        border: none !important;
+        border-color: transparent !important;
+        box-shadow: none !important;
+        padding: 0 !important;
+        margin: 0 !important;
+    }
+
+    /* =========================================================================
+       PARTICIPATION TAB CARD-BUTTONS (Total Users, Make Admin, etc.)
+       ========================================================================= */
+    div[data-testid="stVerticalBlock"]:has(#participation-tab-marker) button[data-testid*="baseButton"] {
+        background-color: #2563EB !important;
+        background: #2563EB !important;
+        color: #FFFFFF !important;
+        font-family: 'Outfit', sans-serif !important;
+        font-size: 1.05rem !important;
+        font-weight: 700 !important;
+        border-radius: 12px !important;
+        border: 1px solid #60A5FA !important;
+        padding: 0.9rem 1.8rem !important; /* Larger padding for card-like height */
+        height: auto !important;
+        min-height: 3.5rem !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        transition: all 0.3s ease !important;
+        width: 100% !important;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1) !important; /* Enhanced shadow */
+        opacity: 1 !important;
+    }
+    
+    div[data-testid="stVerticalBlock"]:has(#participation-tab-marker) button[data-testid*="baseButton"]:hover {
+        background-color: #FFFFFF !important;
+        background: #FFFFFF !important;
+        color: #1F2937 !important;
+        border: 1px solid #60A5FA !important;
+        box-shadow: 0 8px 20px rgba(0, 0, 0, 0.25) !important; /* Enhanced hover shadow */
+        transform: translateY(-2px) !important;
+    }
+
+    /* Force all child elements inside participation buttons to inherit styling */
+    div[data-testid="stVerticalBlock"]:has(#participation-tab-marker) button[data-testid*="baseButton"] * {
+        background-color: transparent !important;
+        background: transparent !important;
+        color: inherit !important;
+        border: none !important;
+        border-color: transparent !important;
+        box-shadow: none !important;
+        padding: 0 !important;
+        margin: 0 !important;
+        font-family: inherit !important;
+        font-size: inherit !important;
+        font-weight: inherit !important;
+    }
+
+    /* Enforce perfect centering and block display for all headings globally */
+    h1, h2, h3, 
+    [data-testid="stMarkdown"] h1, 
+    [data-testid="stMarkdown"] h2, 
+    [data-testid="stMarkdown"] h3,
+    h1 *, h2 *, h3 * {
+        text-align: center !important;
+        margin-left: auto !important;
+        margin-right: auto !important;
+        display: block !important;
+        width: 100% !important;
+    }
+
+    /* Mobile viewport adjustments for fonts, padding, and text-wrapping */
+    @media (max-width: 768px) {
+        h1, .main-header h1,
+        h2, [data-testid="stMarkdown"] h2,
+        h3, [data-testid="stMarkdown"] h3 {
+            white-space: nowrap !important;
+            display: inline-block !important;
+            position: relative !important;
+            left: 50% !important;
+            transform: translateX(-50%) !important;
+            text-align: center !important;
+        }
+        
+        /* Reduce box/card paddings and force full width on mobile to maximize text area space */
+        .content-box,
+        div[data-testid="stVerticalBlockBorder"],
+        div.stVerticalBlockBorder,
+        [data-testid="stVerticalBlock"] > div[style*="border"],
+        .st-emotion-cache-12w0qpk,
+        .st-emotion-cache-1y4p8pa {
+            padding: 1rem !important;
+            margin-left: 0 !important;
+            margin-right: 0 !important;
+            width: 100% !important;
+            box-sizing: border-box !important;
+        }
+        
+        /* Make the rules list bullet items fit perfectly without overflow on mobile */
+        .content-box ul {
+            padding-left: 1.1rem !important;
+            margin-left: 0 !important;
+            width: 100% !important;
+        }
+        /* Style the KPI buttons to look exactly like metric cards */
+        div[class*="st-key-btn_kpi_"] > div.stButton > button {
+            background-color: #FFFFFF !important;
+            color: #1F2937 !important;
+            border: 1px solid #60A5FA !important;
+            border-left: 6px solid #2563EB !important;
+            border-radius: 10px !important;
+            padding: 10px 15px !important;
+            text-align: left !important;
+            display: flex !important;
+            flex-direction: column !important;
+            justify-content: center !important;
+            align-items: flex-start !important;
+            height: 90px !important;
+            width: 100% !important;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05) !important;
+            transition: all 0.2s ease !important;
+            font-family: 'Outfit', sans-serif !important;
+        }
+        
+        div[class*="st-key-btn_kpi_"] > div.stButton > button:hover {
+            border-color: #3b82f6 !important;
+            border-left-color: #3b82f6 !important;
+            box-shadow: 0 4px 6px rgba(59, 130, 246, 0.15) !important;
+        }
+        
+        div[class*="st-key-btn_kpi_"] > div.stButton > button p {
+            margin: 0 !important;
+            padding: 0 !important;
+            font-size: 0.9rem !important;
+            font-weight: 700 !important;
+        }
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# Session State Initialization
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+if "user_role" not in st.session_state:
+    st.session_state.user_role = None
+if "username" not in st.session_state:
+    st.session_state.username = ""
+if "user_id" not in st.session_state:
+    st.session_state.user_id = None
+if "approval_status" not in st.session_state:
+    st.session_state.approval_status = None
+if "current_page" not in st.session_state:
+    st.session_state.current_page = "Home / Scanner"
+if "registration_step" not in st.session_state:
+    st.session_state.registration_step = "form"  # "form", "enroll", "password"
+if "captcha_data" not in st.session_state:
+    st.session_state.captcha_data = None
+if "reg_user_id" not in st.session_state:
+    st.session_state.reg_user_id = None
+if "scanning" not in st.session_state:
+    st.session_state.scanning = False
+if "show_register_prompt" not in st.session_state:
+    st.session_state.show_register_prompt = False
+if "checkout_prompt" not in st.session_state:
+    st.session_state.checkout_prompt = False
+if "checkout_queue" not in st.session_state:
+    st.session_state.checkout_queue = []
+if "checkout_user_id" not in st.session_state:
+    st.session_state.checkout_user_id = None
+if "checkout_name" not in st.session_state:
+    st.session_state.checkout_name = ""
+if "scan_feedback" not in st.session_state:
+    st.session_state.scan_feedback = ""
+
+
+# Sidebar Navigation
+st.sidebar.markdown(f"<h2 style='text-align: center; color: #1F2937;'>📷 Face Attendance</h2>", unsafe_allow_html=True)
+
+# Connection Status Indicator
+is_connected = api.check_health()
+if is_connected:
+    st.sidebar.markdown(
+        "<div style='text-align: center;'><span class='status-badge status-approved' style='background-color: #28a745 !important; color: #FFFFFF !important; border-color: #28a745 !important;'>● Online</span></div>", 
+        unsafe_allow_html=True
+    )
+else:
+    st.sidebar.markdown(
+        "<div style='text-align: center;'><span class='status-badge status-rejected'>● Offline (Check Backend Server)</span></div>", 
+        unsafe_allow_html=True
+    )
+
+st.sidebar.write("---")
+
+# Navigation buttons
+if not st.session_state.authenticated:
+    page_options = ["Home / Scanner", "Login", "Register"]
+else:
+    if st.session_state.user_role == "Admin":
+        page_options = ["Admin Dashboard", "Home / Scanner", "Profile", "Report"]
+    elif st.session_state.user_role == "User":
+        page_options = ["User Dashboard", "Home / Scanner", "Profile"]
+    else:  # Registered / Pending Approval
+        page_options = ["Pending Dashboard", "Home / Scanner", "Profile"]
+
+for p in page_options:
+    if st.sidebar.button(p, key=f"nav_{p}"):
+        st.session_state.last_page_tracker = st.session_state.current_page
+        st.session_state.current_page = p
+        st.rerun()
+
+if st.session_state.authenticated:
+    st.sidebar.write("---")
+    st.sidebar.write(f"Logged in as: **{st.session_state.username}** ({st.session_state.user_role})")
+    if st.sidebar.button("Logout", key="btn_logout"):
+        st.session_state.authenticated = False
+        st.session_state.user_role = None
+        st.session_state.username = ""
+        st.session_state.user_id = None
+        st.session_state.approval_status = None
+        st.session_state.current_page = "Home / Scanner"
+        api.clear_token()
+        st.rerun()
+
+# Header banner with Navigation Buttons
+with st.container():
+    st.markdown("<div id='header-nav-marker'></div>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center; color: white !important; margin: 0; font-weight: 700; font-size: 2.2rem;'>Face AI Attendance System</h1>", unsafe_allow_html=True)
+    
+    # Navigation buttons inside the header aligned to the user's requested order
+    if not st.session_state.authenticated:
+        nav_pages = ["Home / Scanner", "Feature", "Techstack", "Comment", "Team", "Login", "Register"]
+    else:
+        # Determine current Dashboard name
+        if st.session_state.user_role == "Admin":
+            dash = "Admin Dashboard"
+            nav_pages = [dash, "Home / Scanner", "Feature", "Techstack", "Comment", "Team", "Profile", "Report", "Logout"]
+        else:
+            if st.session_state.user_role == "User":
+                dash = "User Dashboard"
+            else:
+                dash = "Pending Dashboard"
+            nav_pages = [dash, "Home / Scanner", "Feature", "Techstack", "Comment", "Team", "Profile", "Logout"]
+        
+    # Render columns for buttons. Column widths are overridden in CSS to wrap content tightly with constant gaps.
+    cols = st.columns(len(nav_pages))
+        
+    for idx, p in enumerate(nav_pages):
+        with cols[idx]:
+            is_current = (st.session_state.current_page == p)
+            btn_type = "primary" if is_current else "secondary"
+            if p == "Logout":
+                if st.button("Logout", key="header_nav_logout", type="secondary"):
+                    st.session_state.authenticated = False
+                    st.session_state.user_role = None
+                    st.session_state.username = ""
+                    st.session_state.user_id = None
+                    st.session_state.approval_status = None
+                    st.session_state.current_page = "Home / Scanner"
+                    api.clear_token()
+                    st.rerun()
+            else:
+                if st.button(p, key=f"header_nav_{p}", type=btn_type):
+                    st.session_state.current_page = p
+                    st.rerun()
+
+# --- PAGES ---
+
+# A. FEATURE PAGE
+if st.session_state.current_page == "Feature":
+    st.subheader("💡 Core AI Features")
+    st.write("Explore the advanced technologies driving the Face AI Attendance System.")
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.markdown("""
+        <div class='content-box'>
+            <h4 style='color: #4f46e5; margin-top: 0; display: flex; align-items: center; gap: 0.5rem;'>📷 YOLOv8 Face Detection</h4>
+            <p style='color: #334155; margin-bottom: 0.5rem; font-size: 0.95rem;'>
+                High-speed bounding box localization optimized for low-latency scanning.
+            </p>
+            <p style='color: #475569; font-size: 0.85rem;'>
+                Performs deep learning-based single and multi-face localization across video stream frames, providing pre-processed segments for subsequent recognition steps.
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+    with col2:
+        st.markdown("""
+        <div class='content-box'>
+            <h4 style='color: #7c3aed; margin-top: 0; display: flex; align-items: center; gap: 0.5rem;'>⚡ InsightFace ArcFace</h4>
+            <p style='color: #334155; margin-bottom: 0.5rem; font-size: 0.95rem;'>
+                Industrial-grade 512D facial vector embedding recognition.
+            </p>
+            <p style='color: #475569; font-size: 0.85rem;'>
+                Uses the state-of-the-art <code>buffalo_sc</code> deep model to extract distinct facial feature mappings, verifying identities against database records with cosine similarity comparison.
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+    with col3:
+        st.markdown("""
+        <div class='content-box'>
+            <h4 style='color: #0d9488; margin-top: 0; display: flex; align-items: center; gap: 0.5rem;'>🛡️ Liveness & Anti-Spoofing</h4>
+            <p style='color: #334155; margin-bottom: 0.5rem; font-size: 0.95rem;'>
+                Pose-symmetry estimation and validation filters.
+            </p>
+            <p style='color: #475569; font-size: 0.85rem;'>
+                Integrated MediaPipe FaceMesh landmark analysis calculating symmetry ratios to check head orientation, ensuring only live individuals are recorded.
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+
+# A2. TECHSTACK PAGE
+elif st.session_state.current_page == "Techstack":
+    st.subheader("🛠️ Technical Stack")
+    st.write("Detailed breakdown of the architecture, models, and dependencies powering this platform.")
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.markdown("""
+        <div class='content-box'>
+            <h4 style='color: #4f46e5; margin-top: 0; border-bottom: 2px solid #e2e8f0; padding-bottom: 0.5rem;'>🧠 Core AI & Computer Vision</h4>
+            <ul style='color: #334155; margin-left: 0; padding-left: 1.2rem; line-height: 1.6; font-size: 0.9rem;'>
+                <li style='margin-bottom: 0.5rem;'><b>InsightFace ArcFace</b>: Deep model mapping faces to 512D spatial coordinates for exact identification.</li>
+                <li style='margin-bottom: 0.5rem;'><b>MediaPipe Tasks</b>: Live landmark tracking assessing head rotation.</li>
+                <li style='margin-bottom: 0.5rem;'><b>YOLOv8-Face</b>: Backup model to perform fast face bounding-box localization.</li>
+                <li><b>OpenCV</b>: Native system camera IO management, frame rotation, and image preprocessing.</li>
+            </ul>
+        </div>
+        """, unsafe_allow_html=True)
+    with col2:
+        st.markdown("""
+        <div class='content-box'>
+            <h4 style='color: #7c3aed; margin-top: 0; border-bottom: 2px solid #e2e8f0; padding-bottom: 0.5rem;'>🌐 Web Architecture & API</h4>
+            <ul style='color: #334155; margin-left: 0; padding-left: 1.2rem; line-height: 1.6; font-size: 0.9rem;'>
+                <li style='margin-bottom: 0.5rem;'><b>FastAPI backend</b>: Asynchronous routes with validation using Pydantic schemas.</li>
+                <li style='margin-bottom: 0.5rem;'><b>Streamlit frontend</b>: Visual dashboards mapping user data tables.</li>
+                <li style='margin-bottom: 0.5rem;'><b>Uvicorn</b>: Lightning-fast ASGI runner hosting the endpoint interface.</li>
+                <li><b>HTTP Requests</b>: Communication protocol between the frontend script and local server APIs.</li>
+            </ul>
+        </div>
+        """, unsafe_allow_html=True)
+    with col3:
+        st.markdown("""
+        <div class='content-box'>
+            <h4 style='color: #0d9488; margin-top: 0; border-bottom: 2px solid #e2e8f0; padding-bottom: 0.5rem;'>💾 Database & Security</h4>
+            <ul style='color: #334155; margin-left: 0; padding-left: 1.2rem; line-height: 1.6; font-size: 0.9rem;'>
+                <li style='margin-bottom: 0.5rem;'><b>MySQL / PyMySQL</b>: Relational database storing user tables and logs.</li>
+                <li style='margin-bottom: 0.5rem;'><b>Bcrypt</b>: Strong security password encryption for dashboards.</li>
+                <li style='margin-bottom: 0.5rem;'><b>JWT (JSON Web Tokens)</b>: Stateful user role authorizations.</li>
+                <li><b>python-dotenv</b>: Environment separation configuration files.</li>
+            </ul>
+        </div>
+        """, unsafe_allow_html=True)
+
+# B. COMMENT PAGE
+elif st.session_state.current_page == "Comment":
+    st.subheader("💬 User Comments & Feedback")
+    st.write("Submit comments, suggestions, or reports directly to the administration team.")
+
+    # Load comments from DB
+    try:
+        db_comments = api.get_comments()
+    except Exception as e:
+        db_comments = []
+        st.error(f"Could not load comments: {e}")
+
+    with st.container():
+        st.markdown("""
+            <div style='background-color: #f8fafc; border-left: 4px solid #3b82f6; padding: 0.75rem 1rem; border-radius: 4px; margin-bottom: 1.5rem;'>
+                <p style='color: #1e293b; margin: 0; font-size: 0.9rem; font-weight: 500;'>
+                    ℹ️ Feedback board is online. Your comments help us improve the platform.
+                </p>
+            </div>
+        """, unsafe_allow_html=True)
+
+        # Display comments (latest first)
+        if db_comments:
+            for comm in db_comments:
+                c_col1, c_col2 = st.columns([12, 1])
+                with c_col1:
+                    st.markdown(
+                        f"""
+                        <div style='background-color: #ffffff; padding: 1rem; border-radius: 8px;
+                                    margin-bottom: 0.75rem; border: 1px solid #e2e8f0; box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05);'>
+                            <p style='margin: 0; font-size: 0.85rem; color: #64748b;'>
+                                <strong style='color: #1e293b;'>🧑‍💻 {comm['user_name']}</strong>
+                                <span style='font-size: 0.78rem; margin-left: 0.5rem;'>· {comm['created_at']}</span>
+                            </p>
+                            <p style='margin: 0.4rem 0 0 0; color: #334155; font-size: 0.95rem; line-height: 1.5;'>{comm['comment_text']}</p>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
+                with c_col2:
+                    # Only Admin sees delete button
+                    if st.session_state.get("user_role") == "Admin":
+                        if st.button("🗑️", key=f"del_comment_{comm['id']}", help="Delete this comment"):
+                            try:
+                                api.delete_comment(comm["id"])
+                                st.success("Comment deleted.")
+                                st.rerun()
+                            except Exception as ex:
+                                st.error(f"Delete failed: {ex}")
+        else:
+            st.markdown(
+                "<p style='color: #94a3b8; text-align: center; padding: 2rem; font-style: italic;'>No comments yet. Be the first to share your thoughts!</p>",
+                unsafe_allow_html=True
+            )
+
+        st.markdown("<hr style='border-top: 1px solid #e2e8f0; margin: 1.5rem 0;'>", unsafe_allow_html=True)
+        
+        # Post new comment (uses st.form with clear_on_submit to handle input reset cleanly without session state errors)
+        with st.form("new_comment_form", clear_on_submit=True):
+            comm_col1, comm_col2 = st.columns([5, 1])
+            with comm_col1:
+                new_comment = st.text_input(
+                    "Write a comment...",
+                    placeholder="Type your comment here and click Post...",
+                    label_visibility="collapsed"
+                )
+            with comm_col2:
+                submit_comment = st.form_submit_button("Post", type="primary", use_container_width=True)
+                
+            if submit_comment:
+                if new_comment.strip():
+                    try:
+                        user_id = st.session_state.get("user_id")
+                        user_name = st.session_state.get("username", "Anonymous") \
+                                    if st.session_state.get("authenticated") else "Anonymous"
+                        api.post_comment(user_id, user_name, new_comment.strip())
+                        st.success("Comment posted successfully!")
+                        st.rerun()
+                    except Exception as ex:
+                        st.error(f"Failed to post: {ex}")
+                else:
+                    st.warning("Comment cannot be empty.")
+
+
+
+# C. TEAM PAGE
+elif st.session_state.current_page == "Team":
+    st.subheader("👥 Meet the Development Team")
+    st.write("The engineers behind the Face AI contactless attendance system.")
+    
+    # Initialize session states for toggling contact details
+    if "show_danvanthiri" not in st.session_state:
+        st.session_state.show_danvanthiri = False
+    if "show_bavanshree" not in st.session_state:
+        st.session_state.show_bavanshree = False
+        
+    team_col1, team_col2 = st.columns(2)
+    with team_col1:
+        st.markdown("""
+        <div class='content-box'>
+            <h4 style='color: #1F2937; margin-top: 0;'>🧑‍💻 Machine Learning Specialist & Core Architect</h4>
+            <p style='color: #1F2937; margin-bottom: 0.2rem; font-style: italic;'>Student Developer</p>
+            <p style='color: #1F2937; margin-bottom: 0.5rem;'>Specializes in deep learning architectures and real-time computer vision pipelines. Responsible for optimizing the YOLOv8 face detection framework, managing embedded datasets, and minimizing inference response latency to ensure seamless contactless scanning.</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        if st.button("Danvanthiri V", key="btn_dan", use_container_width=True):
+            st.session_state.show_danvanthiri = not st.session_state.show_danvanthiri
+            st.rerun()
+            
+        if st.session_state.show_danvanthiri:
+            st.markdown("""
+            <div style='background-color: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; padding: 10px; margin-top: 5px; color: #166534;'>
+                <b>📞 Phone:</b> +916374098843<br>
+                <b>✉️ Email:</b> danvanthirivenugopal@gmail.com
+            </div>
+            """, unsafe_allow_html=True)
+
+    with team_col2:
+        st.markdown("""
+        <div class='content-box'>
+            <h4 style='color: #1F2937; margin-top: 0;'>🧑‍💻 Machine Learning Specialist & Pipeline Engineer</h4>
+            <p style='color: #1F2937; margin-bottom: 0.2rem; font-style: italic;'>Student Developer</p>
+            <p style='color: #1F2937; margin-bottom: 0.5rem;'>Expert in ML workflow engineering and data preprocessing pipelines. Focuses on feature extraction, threshold tuning for high-accuracy facial recognition, and structuring backend state management to reliably route system logs.</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        if st.button("Bavan shree N", key="btn_bavan", use_container_width=True):
+            st.session_state.show_bavanshree = not st.session_state.show_bavanshree
+            st.rerun()
+            
+        if st.session_state.show_bavanshree:
+            st.markdown("""
+            <div style='background-color: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; padding: 10px; margin-top: 5px; color: #166534;'>
+                <b>📞 Phone:</b> +919843215073<br>
+                <b>✉️ Email:</b> mallikabavan@gmail.com
+            </div>
+            """, unsafe_allow_html=True)
+        
+        
+elif st.session_state.current_page == "Home / Scanner":
+    col_left, col_mid, col_right = st.columns([1, 1.8, 1])
+    
+    with col_mid:
+        st.markdown("<h2 style='text-align: center; color: #1F2937; font-family: \"Outfit\", sans-serif; font-weight: 800; margin-top: 1.5rem; margin-bottom: 1.5rem;'>Live Attendance Scanner</h2>", unsafe_allow_html=True)
+        
+        # Auto-start scanner initialization
+        if st.session_state.get("last_page_tracker") != "Home / Scanner":
+            st.session_state.last_page_tracker = "Home / Scanner"
+            if "cooldowns" not in st.session_state:
+                st.session_state.cooldowns = {}
+            if "pending_checkout_user" not in st.session_state:
+                st.session_state.pending_checkout_user = None
+
+        # Checkout prompt modal dialog (Rendered ABOVE camera so it doesn't get blocked)
+        if st.session_state.get("pending_checkout_user"):
+            user_info = st.session_state.pending_checkout_user
+            with st.container(border=True):
+                st.markdown(f"<h3 style='text-align: center; color: #1F2937;'>👋 Welcome back, {user_info['name']}!</h3>", unsafe_allow_html=True)
+                st.markdown(f"<p style='text-align: center; color: #1F2937;'><b>{user_info['name']} has already checked-in today.</b> Are you leaving now?</p>", unsafe_allow_html=True)
+                
+                btn_col1, btn_col2 = st.columns(2)
+                with btn_col1:
+                    if st.button("Yes, Leave Now", key="btn_checkout_yes", type="primary", use_container_width=True):
+                        try:
+                            api.check_out(user_info["user_id"])
+                            st.success(f"✅ Leaving time recorded successfully for {user_info['name']}. Have a nice evening!")
+                            time.sleep(1.5)
+                        except Exception as e:
+                            st.error(f"Error checking out: {e}")
+                            time.sleep(1.5)
+                        finally:
+                            st.session_state.cooldowns[user_info["user_id"]] = time.time()
+                            st.session_state.pending_checkout_user = None
+                            st.rerun()
+                with btn_col2:
+                    if st.button("No, Stay", key="btn_checkout_no", use_container_width=True):
+                        st.info(f"ℹ️ {user_info['name']}'s attendance is already marked.")
+                        time.sleep(1.5)
+                        st.session_state.cooldowns[user_info["user_id"]] = time.time()
+                        st.session_state.pending_checkout_user = None
+                        st.rerun()
+        
+        # Placeholders for scan states
+        status_placeholder = st.empty()
+        frame_placeholder = st.empty()
+        
+        # We only run the camera loop if there's no pending prompt that needs full attention
+        if not st.session_state.get("pending_checkout_user"):
+            cap = None
+            if not st.session_state.get("scanning", False):
+                if st.button("▶️ Start Camera Scanner", type="primary", use_container_width=True):
+                    st.session_state.scanning = True
+                    st.rerun()
+            else:
+                if st.button("⏹️ Stop Camera Scanner", use_container_width=True):
+                    st.session_state.scanning = False
+                    if "camera" in st.session_state and st.session_state.camera is not None:
+                        st.session_state.camera.release()
+                        st.session_state.camera = None
+                    st.rerun()
+                    
+                if "camera" not in st.session_state or st.session_state.camera is None or not st.session_state.camera.isOpened():
+                    st.session_state.camera = cv2.VideoCapture(0)
+                    
+                cap = st.session_state.camera
+            
+            if cap is not None:
+                if not cap.isOpened():
+                    status_placeholder.error("Cannot open system web-camera. Make sure it is connected.")
+                else:
+                    last_call_time = 0.0
+                    scan_line_y = 0
+                    scan_dir = 1
+                
+                    if "active_scanner_detections" not in st.session_state:
+                        st.session_state.active_scanner_detections = []
+                    
+                    # Continuous scanner loop
+                    try:
+                        while True:
+                            ret, frame = cap.read()
+                            if not ret:
+                                time.sleep(0.05)
+                                continue
+                            
+                            frame = cv2.flip(frame, 1)
+                            clean_frame = frame.copy()
+                            h, w, _ = frame.shape
+                        
+                            # Draw real-time bounding boxes
+                            if st.session_state.get("active_scanner_detections"):
+                                for det in st.session_state.active_scanner_detections:
+                                    bbox = det.get("bbox")
+                                    if bbox and len(bbox) == 4:
+                                        x1, y1, x2, y2 = bbox
+                                        name = det.get("name", "Unknown")
+                                        status_det = det.get("status", "unknown")
+                                        user_id = det.get("user_id")
+                                        draw_face_overlay(frame, x1, y1, x2, y2, name, user_id, status_det)
+                            else:
+                                # Draw default guides
+                                box_w, box_h = int(w * 0.45), int(h * 0.55)
+                                bx1, by1 = int((w - box_w)/2), int((h - box_h)/2)
+                                bx2, by2 = bx1 + box_w, bx1 + box_h
+                                cv2.rectangle(frame, (bx1, by1), (bx2, by2), (255, 255, 255), 2)
+                                cv2.putText(frame, "ALIGN FACE HERE", (bx1 + 10, by1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                            
+                            # Scanning line animation
+                            scan_line_y += 8 * scan_dir
+                            box_h_guide = int(h * 0.55)
+                            if scan_line_y >= box_h_guide or scan_line_y <= 0:
+                                scan_dir *= -1
+                            by1_guide = int((h - box_h_guide)/2)
+                            bx1_guide = int((w - int(w * 0.45))/2)
+                            bx2_guide = bx1_guide + int(w * 0.45)
+                            line_pos = by1_guide + scan_line_y
+                            cv2.line(frame, (bx1_guide + 5, line_pos), (bx2_guide - 5, line_pos), (255, 255, 255), 2)
+                        
+                            frame_placeholder.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), channels="RGB")
+                        
+                            # Trigger API scan validation every 800ms
+                            current_time = time.time()
+                            if current_time - last_call_time >= 0.8:
+                                last_call_time = current_time
+                            
+                                _, img_encoded = cv2.imencode('.jpg', clean_frame)
+                                image_bytes = img_encoded.tobytes()
+                            
+                                try:
+                                    res = api.scan_attendance_face(image_bytes)
+                                    status = res.get("status")
+                                
+                                    # Convert single status to multiple results structure for unified parsing
+                                    if status in ["recognized", "already_marked", "ask_leave", "not_approved"]:
+                                        res["results"] = [{"status": status, "name": res.get("name"), "user_id": res.get("user_id"), "bbox": res.get("bbox", [])}]
+                                        status = "recognized_multiple"
+                                    
+                                    if status == "recognized_multiple":
+                                        items = res.get("results", [])
+                                        st.session_state.active_scanner_detections = items
+                                    
+                                        need_rerun = False
+                                        messages = []
+                                        has_unknown = False
+                                        
+                                        for item in items:
+                                            item_status = item.get("status")
+                                            user_id = item.get("user_id")
+                                            
+                                            if item_status == "unknown":
+                                                has_unknown = True
+                                                continue
+                                                
+                                            if not user_id:
+                                                continue
+                                            
+                                            # Check cooldown (30 seconds)
+                                            last_action_time = st.session_state.cooldowns.get(user_id, 0)
+                                            if current_time - last_action_time < 30.0:
+                                                continue
+                                            
+                                            if item_status == "recognized":
+                                                st.session_state.cooldowns[user_id] = current_time
+                                                messages.append(("success", f"🎉 Attendance Marked Successfully. Welcome {item['name']}!"))
+                                            
+                                            elif item_status == "already_marked":
+                                                st.session_state.cooldowns[user_id] = current_time
+                                                messages.append(("info", f"ℹ️ {item['name']}, your attendance is already completely marked for today."))
+                                            
+                                            elif item_status == "ask_leave":
+                                                # Trigger Stay/Leave Prompt (only set if not already set to avoid override)
+                                                if not st.session_state.get("pending_checkout_user"):
+                                                    st.session_state.pending_checkout_user = {"user_id": user_id, "name": item["name"]}
+                                                    need_rerun = True
+                                            
+                                            elif item_status == "not_approved":
+                                                st.session_state.cooldowns[user_id] = current_time
+                                                messages.append(("warning", f"⏳ {item['name']}, your account is pending admin approval."))
+                                        
+                                        # Also handle unknown warning with a short 3s cooldown
+                                        if has_unknown:
+                                            last_unknown_time = st.session_state.cooldowns.get("unknown_face", 0)
+                                            if current_time - last_unknown_time >= 3.0:
+                                                st.session_state.cooldowns["unknown_face"] = current_time
+                                                messages.append(("warning", "⚠️ Unknown User Detected"))
+                                                
+                                        # Render all gathered messages together inside the placeholder
+                                        if messages:
+                                            with status_placeholder.container():
+                                                for msg_type, msg_text in messages:
+                                                    if msg_type == "success":
+                                                        st.success(msg_text)
+                                                    elif msg_type == "info":
+                                                        st.info(msg_text)
+                                                    elif msg_type == "warning":
+                                                        st.warning(msg_text)
+                                                        
+                                        if need_rerun:
+                                            st.rerun()
+                                        
+                                    elif status == "unknown":
+                                        st.session_state.active_scanner_detections = res.get("results", [])
+                                        status_placeholder.warning("⚠️ Unknown Face Detected")
+                                        
+                                    elif status in ["not_aligned", "no_face"]:
+                                        st.session_state.active_scanner_detections = []
+                                        # Do not spam the UI, just quietly wait
+                                    
+                                except Exception as e:
+                                    pass # Ignore temporary API failures during continuous loop
+                                
+                            time.sleep(0.03)
+                        
+                    except Exception as e:
+                        # Streamlit RerunException will be caught here silently when a button is clicked or page changes
+                        pass
+
+        st.write("---")
+
+
+        st.markdown("""
+        <div class='content-box' style='max-width: 650px; margin: 0 auto; width: 100%;'>
+            <h3 style='color: #1F2937; margin-top: 0; text-align: center;'>📋 Attendance Rules</h3>
+            <div style='display: flex; justify-content: center;'>
+                <ul style='color: #1F2937; text-align: left; margin: 0; padding-left: 1.2rem; line-height: 1.6;'>
+                    <li><b>Daily Record</b>: Only one attendance card is allowed per day.</li>
+                    <li><b>Check-In</b>: Captured automatically on first recognition.</li>
+                    <li><b>Check-Out</b>: Prompts if scanned a second time.</li>
+                    <li><b>Requirements</b>:
+                         <ul style='padding-left: 1.2rem;'>
+                              <li>Look directly at the camera guides.</li>
+                              <li>Ensure good face lighting.</li>
+                              <li>Remove sunglasses or hats during scans.</li>
+                         </ul>
+                    </li>
+                </ul>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+
+# 2. LOGIN PAGE
+elif st.session_state.current_page == "Login":
+    col_left, col_mid, col_right = st.columns([1, 1.8, 1])
+    
+    with col_mid:
+        st.markdown("<h2 style='text-align: center; color: #1F2937; font-family: \"Outfit\", sans-serif; font-weight: 800; margin-top: 1.5rem; margin-bottom: 1.5rem;'>🔑 Sign In to Dashboard</h2>", unsafe_allow_html=True)
+        with st.container(border=True):
+            with st.form("login_form"):
+                email = st.text_input("Email ID")
+                password = st.text_input("Password", type="password")
+                submit = st.form_submit_button("Sign In")
+                
+                if submit:
+                    if not email or not password:
+                        st.error("Please enter email and password.")
+                    else:
+                        try:
+                            res = api.login(email, password)
+                            st.session_state.authenticated = True
+                            st.session_state.user_role = res.get("role")
+                            st.session_state.username = res.get("name")
+                            st.session_state.user_id = res.get("user_id")
+                            st.session_state.approval_status = res.get("approval_status")
+                            
+                            st.success(f"Welcome back, {res.get('name')}!")
+                            time.sleep(1.0)
+                            
+                            # Route dashboard
+                            if res.get("role") == "Admin":
+                                st.session_state.current_page = "Admin Dashboard"
+                            elif res.get("role") == "User":
+                                st.session_state.current_page = "User Dashboard"
+                            else:
+                                st.session_state.current_page = "Pending Dashboard"
+                            st.rerun()
+                        except Exception as e:
+                            import requests
+                            if isinstance(e, requests.exceptions.ConnectionError) or "Failed to establish a new connection" in str(e) or "Max retries exceeded" in str(e):
+                                st.error("❌ Connection to the backend server failed. Please make sure the FastAPI backend server is running (port 8000) using 'start_services.bat'.")
+                            else:
+                                st.error(f"Authentication failed: {e}")
+
+# 3. REGISTRATION PAGE
+elif st.session_state.current_page == "Register":
+    col_left, col_mid, col_right = st.columns([1, 1.8, 1])
+    with col_mid:
+        st.markdown("<h2 style='text-align: center; color: #1F2937; font-family: \"Outfit\", sans-serif; font-weight: 800; margin-top: 1.5rem; margin-bottom: 1.5rem;'>📝 Create New Account</h2>", unsafe_allow_html=True)
+    
+        # Registration Flow state machine
+        if st.session_state.registration_step == "form":
+            with st.container(border=True):
+                # Step 1: Form details + CAPTCHA
+                # Per-field errors stored in session_state.reg_field_errors dict
+                fe = st.session_state.get("reg_field_errors", {})
+
+                with st.form("registration_form"):
+                    full_name = st.text_input("Full Name")
+                    if fe.get("full_name"):
+                        st.error(fe["full_name"])
+
+                    email = st.text_input("Email ID")
+                    if fe.get("email"):
+                        st.error(fe["email"])
+
+                    c_code_col, phone_col = st.columns([1, 2])
+                    with c_code_col:
+                        country_code = st.selectbox("Country", ["+91 India", "+1 USA", "+44 UK", "+971 UAE"])
+                    with phone_col:
+                        phone_num = st.text_input("Phone Number")
+                    if fe.get("phone_num"):
+                        st.error(fe["phone_num"])
+
+                    # Department field with auto-capitalization
+                    department = st.text_input("Department", placeholder="e.g. ENGINEERING, HR, SALES")
+                    department = department.upper() if department else ""  # Auto-capitalize while typing
+
+                    # Fetch CAPTCHA from backend if not cached in state
+                    if st.session_state.captcha_data is None:
+                        try:
+                            st.session_state.captcha_data = api.get_captcha()
+                        except Exception as e:
+                            st.error(f"Could not load CAPTCHA: {e}")
+
+                    if st.session_state.captcha_data:
+                        st.write("---")
+                        st.write("🤖 **CAPTCHA Verification**")
+
+                        # Decode image and show
+                        captcha_key = st.session_state.captcha_data["captcha_key"]
+                        captcha_base64 = st.session_state.captcha_data["captcha_image"].split(",")[1]
+                        st.image(Image.open(BytesIO(base64.b64decode(captcha_base64))), caption="Math CAPTCHA")
+
+                        captcha_input = st.text_input("Enter CAPTCHA value")
+                        if fe.get("captcha"):
+                            st.error(fe["captcha"])
+
+                        if st.form_submit_button("Verify & Proceed to Face Enrollment"):
+                            # Reset all field errors on every new submit
+                            errors = {}
+
+                            # --- Client-side empty field checks ---
+                            if not full_name.strip():
+                                errors["full_name"] = "⚠️ Full Name is required."
+                            if not email.strip():
+                                errors["email"] = "⚠️ Email ID is required."
+                            if not phone_num.strip():
+                                errors["phone_num"] = "⚠️ Phone Number is required."
+                            if not captcha_input.strip():
+                                errors["captcha"] = "⚠️ Please enter the CAPTCHA value."
+
+                            if errors:
+                                st.session_state.reg_field_errors = errors
+                                st.rerun()
+                            else:
+                                # All fields filled — attempt registration
+                                temp_password = "TempPass_123456!"
+                                payload = {
+                                    "name": full_name,
+                                    "email": email,
+                                    "phone_number": f"{country_code.split()[0]} {phone_num}",
+                                    "department": department.strip() if department else "",
+                                    "password": temp_password,
+                                    "captcha_key": captcha_key,
+                                    "captcha_value": captcha_input
+                                }
+
+                                try:
+                                    res = api.register(payload)
+                                    st.session_state.reg_user_id = res.get("user_id")
+                                    st.session_state.registration_step = "enroll"
+                                    st.session_state.captcha_data = None
+                                    st.session_state.reg_field_errors = {}
+                                    st.success("Personal details verified. Proceeding to Face Enrollment.")
+                                    time.sleep(1.5)
+                                    st.rerun()
+                                except Exception as e:
+                                    import requests
+                                    if isinstance(e, requests.exceptions.ConnectionError) or "Failed to establish a new connection" in str(e) or "Max retries exceeded" in str(e):
+                                        st.session_state.reg_field_errors = {"full_name": "❌ Connection to the backend server failed. Make sure the FastAPI server is running (port 8000)."}
+                                    else:
+                                        err_msg = str(e)
+                                        # Route server errors to the right field
+                                        if "email" in err_msg.lower() or "Email" in err_msg:
+                                            st.session_state.reg_field_errors = {"email": f"❌ {err_msg}"}
+                                        elif "captcha" in err_msg.lower() or "CAPTCHA" in err_msg:
+                                            st.session_state.reg_field_errors = {"captcha": f"❌ {err_msg}"}
+                                        else:
+                                            st.session_state.reg_field_errors = {"full_name": f"❌ {err_msg}"}
+                                    st.session_state.captcha_data = None
+                                    st.rerun()
+                    else:
+                        st.form_submit_button("Submit")
+
+                # Button to manually refresh CAPTCHA outside form
+                if st.button("Refresh CAPTCHA"):
+                    st.session_state.captcha_data = None
+                    st.rerun()
+        
+        elif st.session_state.registration_step == "enroll":
+            with st.container(border=True):
+                st.markdown("### 👤 Face Enrollment Process")
+                st.markdown("Please align your face in front of the camera and perform the rotations as indicated below.")
+            
+                # Poses list we need to cycle
+                poses_cycle = ["front", "left", "right", "up", "down"]
+            
+                # Track index in state
+                if "enroll_pose_idx" not in st.session_state:
+                    st.session_state.enroll_pose_idx = 0
+                    st.session_state.enroll_captures = {}
+                
+                current_pose = poses_cycle[st.session_state.enroll_pose_idx]
+            
+                pose_instructions = {
+                    "front": "Look directly straight at the camera.",
+                    "left": "Rotate your face towards the LEFT side (profile).",
+                    "right": "Rotate your face towards the RIGHT side (profile).",
+                    "up": "Tilt your face slightly UPWARDS.",
+                    "down": "Tilt your face slightly DOWNWARDS."
+                }
+            
+                instruction_placeholder = st.empty()
+                progress_placeholder = st.empty()
+            
+                instruction_placeholder.info(f"👉 **Current Action**: **{current_pose.upper()}** - {pose_instructions[current_pose]}")
+                progress_placeholder.write(f"Progress: **{st.session_state.enroll_pose_idx} / 5** poses captured.")
+            
+                # Enrollment Camera display loop
+                frame_placeholder = st.empty()
+                status_placeholder = st.empty()
+            
+                start_capture = st.button("Start Enrollment Camera")
+            
+                if start_capture:
+                    cap = cv2.VideoCapture(0)
+                    if not cap.isOpened():
+                        st.error("Cannot access camera.")
+                    else:
+                        last_call = 0.0
+                        try:
+                            while st.session_state.enroll_pose_idx < len(poses_cycle):
+                                ret, frame = cap.read()
+                                if not ret:
+                                    time.sleep(0.05)
+                                    continue
+                                
+                                frame = cv2.flip(frame, 1)
+                                clean_frame = frame.copy()
+                            
+                                # Highlight guide boxes
+                                h, w, _ = frame.shape
+                                cv2.rectangle(frame, (int(w*0.3), int(h*0.2)), (int(w*0.7), int(h*0.8)), (255, 255, 255), 2)
+                                cv2.putText(frame, f"POSE: {current_pose.upper()}", (int(w*0.3), int(h*0.2)-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                            
+                                frame_placeholder.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), channels="RGB")
+                            
+                                # Try sending frame for pose validation
+                                now_time = time.time()
+                                if now_time - last_call >= 0.8:
+                                    last_call = now_time
+                                
+                                    _, img_encoded = cv2.imencode('.jpg', clean_frame)
+                                    image_bytes = img_encoded.tobytes()
+                                
+                                    try:
+                                        status_placeholder.info(f"Scanning for {current_pose.upper()} pose...")
+                                        api.upload_enrollment_pose(st.session_state.reg_user_id, current_pose, image_bytes)
+                                    
+                                        # Success! Save frame and step index
+                                        st.session_state.enroll_captures[current_pose] = True
+                                        st.session_state.enroll_pose_idx += 1
+                                    
+                                        # Update progress dynamically
+                                        progress_placeholder.write(f"Progress: **{st.session_state.enroll_pose_idx} / 5** poses captured.")
+                                    
+                                        status_placeholder.success(f"✓ Captured {current_pose.upper()}!")
+                                        time.sleep(1.0)
+                                    
+                                        if st.session_state.enroll_pose_idx < len(poses_cycle):
+                                            current_pose = poses_cycle[st.session_state.enroll_pose_idx]
+                                            # Update instruction dynamically
+                                            instruction_placeholder.info(f"👉 **Current Action**: **{current_pose.upper()}** - {pose_instructions[current_pose]}")
+                                        else:
+                                            break
+                                    except Exception as e:
+                                        # Show error description returned by pose classifier
+                                        status_placeholder.warning(str(e))
+                                    
+                                time.sleep(0.03)
+                        finally:
+                            cap.release()
+                            frame_placeholder.empty()
+                    
+                        # Check if all completed
+                        if st.session_state.enroll_pose_idx >= 5:
+                            status_placeholder.info("Finalizing face profiles...")
+                            try:
+                                api.complete_enrollment(st.session_state.reg_user_id)
+                                st.session_state.registration_step = "password"
+                                st.rerun()
+                            except Exception as e:
+                                st.error(str(e))
+                            
+                if st.button("Cancel & Restart"):
+                    # Clean up if they restart
+                    if "enroll_pose_idx" in st.session_state:
+                        del st.session_state.enroll_pose_idx
+                    if "enroll_captures" in st.session_state:
+                        del st.session_state.enroll_captures
+                    if "reg_user_id" in st.session_state:
+                        del st.session_state.reg_user_id
+                    st.session_state.registration_step = "form"
+                    st.session_state.captcha_data = None
+                    st.rerun()
+                
+        elif st.session_state.registration_step == "password":
+            with st.container(border=True):
+                st.markdown("### 🔒 Setup Account Password")
+                st.markdown("Please choose a strong password to protect your user account dashboard.")
+            
+                with st.form("password_setup_form"):
+                    password = st.text_input("Password", type="password")
+                    confirm_password = st.text_input("Confirm Password", type="password")
+                    submit = st.form_submit_button("Save Password & Complete Registration")
+                
+                    if submit:
+                        import re
+                        if len(password) < 12:
+                            st.error("Password must be at least 12 characters.")
+                        elif not re.search(r"[A-Z]", password):
+                            st.error("Password must contain at least one uppercase letter.")
+                        elif not re.search(r"[a-z]", password):
+                            st.error("Password must contain at least one lowercase letter.")
+                        elif not re.search(r"\d", password):
+                            st.error("Password must contain at least one number.")
+                        elif not re.search(r"[!@#$%^&*(),.?\":{}|<>]", password):
+                            st.error("Password must contain at least one special character.")
+                        elif password != confirm_password:
+                            st.error("Passwords do not match.")
+                        else:
+                            try:
+                                api.update_password(st.session_state.reg_user_id, password)
+                                st.success("🎉 Registration successfully completed! Waiting for Admin Approval.")
+                            
+                                # Reset states
+                                if "enroll_pose_idx" in st.session_state:
+                                    del st.session_state.enroll_pose_idx
+                                if "enroll_captures" in st.session_state:
+                                    del st.session_state.enroll_captures
+                                if "reg_user_id" in st.session_state:
+                                    del st.session_state.reg_user_id
+                                
+                                st.session_state.registration_step = "form"
+                                st.session_state.captcha_data = None
+                                time.sleep(3.0)
+                                st.session_state.current_page = "Home / Scanner"
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Failed to set password: {e}")
+
+elif st.session_state.current_page == "User Dashboard":
+    st.subheader("👤 User Attendance Dashboard")
+    
+    # Shift Reference Banner
+    st.info("🕒 **Active Shift:** 09:00 AM - 04:00 PM | **Grace Period:** 30 Mins (Late check-in triggers after 09:30 AM)")
+    
+    try:
+        stats = api.get_user_dashboard_stats(st.session_state.user_id)
+        
+        # Top Stats Greetings
+        st.markdown(f"### Welcome back, **{stats.get('name')}**")
+        
+        # Check if face profile expired
+        if stats.get("needs_face_update"):
+            st.warning("⚠️ Your face profile was last updated more than 90 days ago. To maintain high recognition accuracy, please update your face profile now.")
+            if st.button("Update Face Profile Now", type="primary", key="btn_trigger_face_update"):
+                st.session_state.update_face_pose_idx = 0
+                st.session_state.update_face_captures = {}
+                st.session_state.current_page = "Update Face Profile"
+                st.rerun()
+                
+        # History table records first (to calculate hours)
+        history = api.get_user_attendance_history(st.session_state.user_id)
+        
+        # Calculate Total & Avg Work Hours & Late Days
+        total_hours = 0.0
+        avg_hours = 0.0
+        late_days_count = 0
+        if history:
+            valid_days_count = 0
+            for row in history:
+                ch_in = row.get("check_in", "-")
+                ch_out = row.get("check_out", "-")
+                if ch_in != "-" and ch_out != "-":
+                    try:
+                        fmt = "%I:%M %p"
+                        t1 = datetime.strptime(ch_in, fmt)
+                        t2 = datetime.strptime(ch_out, fmt)
+                        dur = (t2 - t1).total_seconds() / 3600.0
+                        if dur > 0:
+                            total_hours += dur
+                            valid_days_count += 1
+                    except Exception:
+                        pass
+                
+                # Late check-in tracking (cutoff at 09:30 AM)
+                if ch_in != "-":
+                    try:
+                        fmt = "%I:%M %p"
+                        chk_time = datetime.strptime(ch_in, fmt).time()
+                        late_cutoff = datetime.strptime("09:30 AM", fmt).time()
+                        if chk_time > late_cutoff:
+                            late_days_count += 1
+                    except Exception:
+                        pass
+            if valid_days_count > 0:
+                avg_hours = total_hours / valid_days_count
+        
+        # 7 Metric Cards Grid
+        col1, col2, col3, col_late, col4, col5, col6 = st.columns(7)
+        with col1:
+            st.markdown(f"""
+            <div class='metric-card'>
+                <p class='stat-label'>Verification Status</p>
+                <span class='status-badge status-approved'>{stats.get('approval_status')}</span>
+            </div>
+            """, unsafe_allow_html=True)
+        with col2:
+            st.markdown(f"""
+            <div class='metric-card'>
+                <p class='stat-label'>Present Days</p>
+                <p class='stat-number'>{stats.get('present_days')}</p>
+            </div>
+            """, unsafe_allow_html=True)
+        with col3:
+            st.markdown(f"""
+            <div class='metric-card'>
+                <p class='stat-label'>Absent Days</p>
+                <p class='stat-number'>{stats.get('absent_days')}</p>
+            </div>
+            """, unsafe_allow_html=True)
+        with col_late:
+            st.markdown(f"""
+            <div class='metric-card'>
+                <p class='stat-label'>Late Days</p>
+                <p class='stat-number' style='color: #e65100;'>{late_days_count}</p>
+            </div>
+            """, unsafe_allow_html=True)
+        with col4:
+            st.markdown(f"""
+            <div class='metric-card'>
+                <p class='stat-label'>Attendance Rate</p>
+                <p class='stat-number'>{stats.get('percentage')}%</p>
+            </div>
+            """, unsafe_allow_html=True)
+        with col5:
+            st.markdown(f"""
+            <div class='metric-card'>
+                <p class='stat-label'>Total Hours (Month)</p>
+                <p class='stat-number'>{total_hours:.1f}h</p>
+            </div>
+            """, unsafe_allow_html=True)
+        with col6:
+            st.markdown(f"""
+            <div class='metric-card'>
+                <p class='stat-label'>Avg Daily Hours</p>
+                <p class='stat-number'>{avg_hours:.1f}h</p>
+            </div>
+            """, unsafe_allow_html=True)
+            
+        # Attendance Status Today
+        st.markdown("### 📅 Today's Timestamps")
+        t_col1, t_col2, t_col3 = st.columns(3)
+        with t_col1:
+            st.markdown(f"<div class='metric-card'><p class='stat-label'>Status</p><h4>{stats.get('today_status')}</h4></div>", unsafe_allow_html=True)
+        with t_col2:
+            st.markdown(f"<div class='metric-card'><p class='stat-label'>Entry Time</p><h4>{stats.get('entry_time') or '-'}</h4></div>", unsafe_allow_html=True)
+        with t_col3:
+            st.markdown(f"<div class='metric-card'><p class='stat-label'>Leaving Time</p><h4>{stats.get('leaving_time') or '-'}</h4></div>", unsafe_allow_html=True)
+            
+        # Live Session Progress Tracker
+        if stats.get("today_status") == "Checked In" and stats.get("entry_time"):
+            try:
+                entry_str = stats.get("entry_time")
+                now_dt = datetime.now()
+                entry_time_parsed = datetime.strptime(entry_str, "%I:%M %p").replace(year=now_dt.year, month=now_dt.month, day=now_dt.day)
+                elapsed = now_dt - entry_time_parsed
+                seconds = elapsed.total_seconds()
+                if seconds > 0:
+                    h, m = divmod(int(seconds) // 60, 60)
+                    st.info(f"⏱️ **Live Session Tracker:** You checked in at **{entry_str}** and have been active for **{h}h {m}m** today.")
+            except Exception as e:
+                logger.error(f"Error calculating elapsed workday time: {e}")
+            
+        # Monthly Percentage Progress Bar
+        st.write("---")
+        st.markdown("### 📊 Month Attendance Rate")
+        st.progress(stats.get('percentage') / 100.0)
+        
+        # Monthly Attendance Rate Plotly Chart
+        if history:
+            import plotly.express as px
+            chart_df = pd.DataFrame(history)
+            if not chart_df.empty and 'date' in chart_df.columns and 'status' in chart_df.columns:
+                chart_df = chart_df.sort_values(by="date")
+                chart_df['Attendance Value (%)'] = chart_df['status'].apply(lambda x: 100 if x in ['Present', 'Late'] else 0)
+                
+                fig = px.bar(
+                    chart_df,
+                    x="date",
+                    y="Attendance Value (%)",
+                    color="status",
+                    color_discrete_map={"Present": "#10b981", "Late": "#f59e0b", "Absent": "#ef4444"},
+                    labels={"date": "Date", "Attendance Value (%)": "Status Rate (%)", "status": "Status"},
+                    title="Daily Attendance Status (Current Month)"
+                )
+                fig.update_layout(
+                    paper_bgcolor='rgba(0,0,0,0)',
+                    plot_bgcolor='rgba(0,0,0,0)',
+                    margin=dict(l=10, r=10, t=40, b=10),
+                    height=280,
+                    xaxis=dict(showgrid=False),
+                    yaxis=dict(showgrid=True, range=[0, 110])
+                )
+                st.plotly_chart(fig, use_container_width=True)
+        
+        # History table
+        st.markdown("### 📜 Recent Logs")
+        if not history:
+            st.info("No attendance records found.")
+        else:
+            import pandas as pd
+            df = pd.DataFrame(history)
+            
+            def color_status(val):
+                if val == 'Present':
+                    return 'background-color: #E8F5E9; color: #2E7D32; font-weight: bold;'
+                elif val == 'Late':
+                    return 'background-color: #FFF3E0; color: #E65100; font-weight: bold;'
+                elif val == 'Absent':
+                    return 'background-color: #FFEBEE; color: #C62828; font-weight: bold;'
+                return ''
+                
+            if hasattr(df.style, 'map'):
+                styled_df = df.style.map(color_status, subset=['status'])
+            else:
+                styled_df = df.style.applymap(color_status, subset=['status'])
+                
+            st.dataframe(styled_df, use_container_width=True, hide_index=True)
+            
+            # Export CSV Download Button
+            csv_data = df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="📥 Export Logs to CSV",
+                data=csv_data,
+                file_name=f"attendance_history_{st.session_state.user_id}.csv",
+                mime="text/csv",
+                key="btn_download_user_logs"
+            )
+            
+        # Self-Service Dispute expander
+        st.write("---")
+        with st.expander("📝 Request Attendance Correction"):
+            st.write("If you missed a clock-in/out or need a record override, please submit a correction request to the administrator:")
+            with st.form("dispute_correction_form"):
+                dispute_date = st.date_input("Date of Attendance", key="disp_date")
+                dispute_type = st.selectbox("Correction Type", ["Forgot to scan in", "Forgot to scan out", "Misread by AI sensor"], key="disp_type")
+                disp_in_time = st.text_input("Correct Check-In Time (HH:MM AM/PM)", value="09:00 AM", key="disp_in")
+                disp_out_time = st.text_input("Correct Check-Out Time (HH:MM AM/PM)", value="05:00 PM", key="disp_out")
+                dispute_reason = st.text_area("Reason/Justification for Correction", key="disp_reason")
+                
+                submit_dispute = st.form_submit_button("Submit Request")
+                if submit_dispute:
+                    if not dispute_reason.strip():
+                        st.error("Please provide a reason for the request.")
+                    else:
+                        import os
+                        import csv
+                        csv_path = r"D:\New folder\pending_corrections.csv"
+                        headers = ["user_id", "user_name", "date", "correction_type", "requested_check_in", "requested_check_out", "reason", "status", "created_at"]
+                        file_exists = os.path.exists(csv_path)
+                        
+                        try:
+                            # Save to CSV
+                            with open(csv_path, mode="a", newline="", encoding="utf-8") as f:
+                                writer = csv.DictWriter(f, fieldnames=headers)
+                                if not file_exists:
+                                    writer.writeheader()
+                                writer.writerow({
+                                    "user_id": st.session_state.user_id,
+                                    "user_name": stats.get("name"),
+                                    "date": str(dispute_date),
+                                    "correction_type": dispute_type,
+                                    "requested_check_in": disp_in_time,
+                                    "requested_check_out": disp_out_time,
+                                    "reason": dispute_reason.strip(),
+                                    "status": "Pending",
+                                    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                })
+                            
+                            # Also keep in session state
+                            if "correction_requests" not in st.session_state:
+                                st.session_state.correction_requests = []
+                            st.session_state.correction_requests.append({
+                                "user_id": st.session_state.user_id,
+                                "user_name": stats.get("name"),
+                                "date": str(dispute_date),
+                                "type": dispute_type,
+                                "requested_check_in": disp_in_time,
+                                "requested_check_out": disp_out_time,
+                                "reason": dispute_reason.strip(),
+                                "status": "Pending"
+                            })
+                            st.success("✅ Correction request submitted to the Administrator successfully!")
+                        except Exception as csv_err:
+                            st.error(f"Failed to submit correction request: {csv_err}")
+                        
+    except Exception as e:
+        st.error(f"Could not load dashboard stats: {e}")
+
+# 5. PENDING USER DASHBOARD
+elif st.session_state.current_page == "Pending Dashboard":
+    col_left, col_mid, col_right = st.columns([1, 1.8, 1])
+    with col_mid:
+        st.markdown("<h2 style='text-align: center; color: #1F2937; font-family: \"Outfit\", sans-serif; font-weight: 800; margin-top: 1.5rem; margin-bottom: 1.5rem;'>⏳ Account Status</h2>", unsafe_allow_html=True)
+        with st.container(border=True):
+            st.markdown("<h3 style='text-align: center; color: #1F2937;'>⏳ Waiting for Admin Approval</h3>", unsafe_allow_html=True)
+            st.markdown("<p style='text-align: center; color: #1F2937;'>Your face profiles and registration details have been submitted.</p>", unsafe_allow_html=True)
+            st.markdown("<p style='text-align: center; color: #1F2937;'>An administrator needs to verify and approve your account before you can mark attendance.</p>", unsafe_allow_html=True)
+            
+            # Center the button using a columns trick
+            _, btn_col, _ = st.columns([1, 2, 1])
+            with btn_col:
+                if st.button("Refresh Approval Status", use_container_width=True):
+                    # Relogin mock to pull latest role status
+                    st.info("Re-checking status...")
+                    try:
+                        # Check profile status directly from JWT token decode or call API
+                        stats = api.get_user_dashboard_stats(st.session_state.user_id)
+                        if stats.get("approval_status") == "Approved":
+                            st.session_state.approval_status = "Approved"
+                            st.session_state.user_role = "User"
+                            st.session_state.current_page = "User Dashboard"
+                            st.success("Congratulations! Your account has been approved.")
+                            time.sleep(2.0)
+                            st.rerun()
+                        else:
+                            st.warning("Your account is still in Pending status.")
+                    except Exception as e:
+                        st.error(f"Check failed: {e}")
+
+# 6. ADMIN DASHBOARD
+elif st.session_state.current_page == "Admin Dashboard":
+    # Header and Settings Button side-by-side
+    col_title, col_settings_btn = st.columns([5, 1])
+    with col_title:
+        st.subheader(" Administrative Console")
+    with col_settings_btn:
+        with st.popover("⚙️ Settings", use_container_width=True):
+            st.write("Configure office timings:")
+            try:
+                current_settings = api.get_attendance_settings()
+                start_time = current_settings.get("start_time", "09:00")
+                end_time = current_settings.get("end_time", "18:00")
+                grace_period = current_settings.get("grace_period_minutes", 30)
+                
+                # Parse 24h start_time and end_time to parts
+                def parse_24h_to_parts(t_str: str):
+                    try:
+                        dt = datetime.strptime(t_str, "%H:%M")
+                        return dt.strftime("%I"), dt.strftime("%M"), dt.strftime("%p")
+                    except Exception:
+                        return "09", "00", "AM"
+                
+                start_h, start_m, start_p = parse_24h_to_parts(start_time)
+                end_h, end_m, end_p = parse_24h_to_parts(end_time)
+                
+                st.markdown("**Office Start Time**")
+                sc1, sc2, sc3 = st.columns(3)
+                with sc1:
+                    new_start_h = st.selectbox("Hour", [f"{i:02d}" for i in range(1, 13)], index=int(start_h)-1, key="start_hour")
+                with sc2:
+                    new_start_m = st.selectbox("Minute", [f"{i:02d}" for i in range(60)], index=int(start_m), key="start_minute")
+                with sc3:
+                    new_start_p = st.selectbox("Period", ["AM", "PM"], index=0 if start_p == "AM" else 1, key="start_period")
+                    
+                st.markdown("**Office End Time**")
+                ec1, ec2, ec3 = st.columns(3)
+                with ec1:
+                    new_end_h = st.selectbox("Hour", [f"{i:02d}" for i in range(1, 13)], index=int(end_h)-1, key="end_hour")
+                with ec2:
+                    new_end_m = st.selectbox("Minute", [f"{i:02d}" for i in range(60)], index=int(end_m), key="end_minute")
+                with ec3:
+                    new_end_p = st.selectbox("Period", ["AM", "PM"], index=0 if end_p == "AM" else 1, key="end_period")
+                
+                new_grace = st.number_input("Grace Period (Minutes)", min_value=0, max_value=480, value=grace_period, step=5, key="grace_period_input")
+                
+                if st.button("💾 Save Settings", type="primary", use_container_width=True, key="btn_save_time_settings"):
+                    try:
+                        # Combine to 24h format for database save
+                        dt_start = datetime.strptime(f"{new_start_h}:{new_start_m} {new_start_p}", "%I:%M %p")
+                        dt_end = datetime.strptime(f"{new_end_h}:{new_end_m} {new_end_p}", "%I:%M %p")
+                        new_start_str = dt_start.strftime("%H:%M")
+                        new_end_str = dt_end.strftime("%H:%M")
+                        api.save_attendance_settings(new_start_str, new_end_str, int(new_grace))
+                        st.success("✅ Time settings updated!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to save settings: {e}")
+                
+                st.markdown("---")
+                st.markdown("#### Current Settings")
+                def to_12h_format(t_str: str) -> str:
+                    try:
+                        return datetime.strptime(t_str, "%H:%M").strftime("%I:%M %p")
+                    except Exception:
+                        return t_str
+                st.markdown(f"**Start:** {to_12h_format(start_time)}  \n**End:** {to_12h_format(end_time)}  \n**Grace:** {grace_period} min")
+                st.markdown("*Late check-in:* After start time + grace period")
+                st.markdown("*Half-day:* Check-in after dynamic midpoint")
+                
+                st.markdown("---")
+                st.markdown("#### 🔄 Model Utilities")
+                if st.button("🔄 Rebuild Face Embeddings Cache", use_container_width=True, key="btn_rebuild_face_cache"):
+                    try:
+                        with st.spinner("Rebuilding known faces embeddings cache..."):
+                            api.rebuild_face_cache()
+                        st.toast("✅ Face embeddings cache rebuilt successfully!")
+                        st.success("Face cache updated!")
+                    except Exception as e:
+                        st.error(f"Failed to rebuild cache: {e}")
+                
+            except Exception as e:
+                st.error(f"Failed to load settings: {e}")
+    # Check if admin user needs face update
+    try:
+        admin_user_stats = api.get_user_dashboard_stats(st.session_state.user_id)
+        if admin_user_stats.get("needs_face_update"):
+            st.warning("⚠️ Your face profile was last updated more than 90 days ago. To maintain high recognition accuracy, please update your face profile now.")
+            if st.button("Update Face Profile Now", type="primary", key="btn_admin_face_update"):
+                st.session_state.update_face_pose_idx = 0
+                st.session_state.update_face_captures = {}
+                st.session_state.current_page = "Update Face Profile"
+                st.rerun()
+    except Exception as e:
+        logger.error(f"Error checking face update status for admin: {e}")
+        
+    # Load statistics
+    try:
+        stats = api.get_admin_stats()
+        
+        # Admin panels tabs
+        tab_part, tab_admin_att, tab_overview, tab_audit = st.tabs([
+            "👥 Participation", 
+            "🛡️ Admin Attendance", 
+            "📈 Attendance Overview", 
+            "📜 System Audit Logs"
+        ])
+        
+        with tab_part:
+            st.markdown("<div id='participation-tab-marker'></div>", unsafe_allow_html=True)
+            # Initialize active view in state if not present (defaults to None, so no list displays until clicked)
+            if "active_part_view" not in st.session_state:
+                st.session_state.active_part_view = None
+                
+            # Clickable metric buttons
+            part_col1, part_col2, part_col3, part_col4 = st.columns(4)
+            with part_col1:
+                type_users = "primary" if st.session_state.active_part_view == "Total Users" else "secondary"
+                total_all_users = stats.get("total_users", 0)
+                if st.button(f"👥 Total Users ({total_all_users})", key="btn_part_total_users", type=type_users):
+                    st.session_state.active_part_view = "Total Users"
+                    st.rerun()
+            with part_col2:
+                type_admins = "primary" if st.session_state.active_part_view == "Total Admins" else "secondary"
+                if st.button(f"🛡️ Total Admins ({stats.get('total_admins', 0)})", key="btn_part_total_admins", type=type_admins):
+                    st.session_state.active_part_view = "Total Admins"
+                    st.rerun()
+            with part_col3:
+                type_pending = "primary" if st.session_state.active_part_view == "Pending Approval" else "secondary"
+                if st.button(f"⏳ Pending Approval ({stats.get('pending_users', 0)})", key="btn_part_pending", type=type_pending):
+                    st.session_state.active_part_view = "Pending Approval"
+                    st.rerun()
+            with part_col4:
+                type_approved = "primary" if st.session_state.active_part_view == "Approved Account" else "secondary"
+                if st.button(f"✅ Approved Account ({stats.get('approved_users', 0)})", key="btn_part_approved", type=type_approved):
+                    st.session_state.active_part_view = "Approved Account"
+                    st.rerun()
+                    
+            if st.session_state.active_part_view:
+                col_title, col_close = st.columns([5, 1])
+                with col_title:
+                    st.markdown(f"### 📍 {st.session_state.active_part_view} database")
+                with col_close:
+                    if st.button("❌ Close List", key="btn_close_part_view"):
+                        st.session_state.active_part_view = None
+                        st.rerun()
+                        
+                users_list = api.get_admin_users_list()
+                
+                # Action logic in state
+                if "admin_confirm_action" in st.session_state:
+                    act = st.session_state.admin_confirm_action
+                    st.warning(f"⚠️ Confirm action: **{act['action'].upper()}** on user **{act['name']}**?")
+                    
+                    c_col1, c_col2 = st.columns(2)
+                    with c_col1:
+                        if st.button("Confirm Action", key="btn_confirm_act"):
+                            try:
+                                if act['action'] == "delete":
+                                    api.remove_user(act['id'])
+                                else:
+                                    api.modify_user_role(act['id'], act['action'])
+                                st.success("Action processed successfully.")
+                                del st.session_state.admin_confirm_action
+                                time.sleep(1.5)
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Action failed: {e}")
+                    with c_col2:
+                        if st.button("Cancel", key="btn_cancel_act"):
+                            del st.session_state.admin_confirm_action
+                            st.rerun()
+                            
+                # Filter and render list based on active view
+                if st.session_state.active_part_view == "Total Users":
+                    display_list = [u for u in users_list if u["role"] == "User"]
+                elif st.session_state.active_part_view == "Total Admins":
+                    display_list = [u for u in users_list if u["role"] == "Admin"]
+                elif st.session_state.active_part_view == "Pending Approval":
+                    display_list = [u for u in users_list if u["approval_status"] == "Pending"]
+                elif st.session_state.active_part_view == "Approved Account":
+                    display_list = [u for u in users_list if u["approval_status"] == "Approved"]
+                
+                if not display_list:
+                    st.info(f"No accounts found for {st.session_state.active_part_view}.")
+                else:
+                    for u in display_list:
+                        if st.session_state.active_part_view == "Pending Approval":
+                            with st.container(border=True):
+                                st.markdown(f"**Name**: {u['name']} | **Email**: {u['email']} | **Phone**: {u['phone_number']}")
+                                app_col1, app_col2 = st.columns(2)
+                                with app_col1:
+                                    if st.button("Approve & Enroll", key=f"btn_approve_{u['id']}"):
+                                        try:
+                                            api.approve_user(u['id'])
+                                            st.success(f"Approved {u['name']}!")
+                                            time.sleep(1.0)
+                                            st.rerun()
+                                        except Exception as e:
+                                            st.error(str(e))
+                                with app_col2:
+                                    if st.button("Reject Request", key=f"btn_reject_{u['id']}"):
+                                        try:
+                                            api.reject_user(u['id'])
+                                            st.warning(f"Rejected {u['name']}!")
+                                            time.sleep(1.0)
+                                            st.rerun()
+                                        except Exception as e:
+                                            st.error(str(e))
+                        else:
+                            with st.expander(f"{u['name']} ({u['role']}) - Status: {u['approval_status']}"):
+                                st.write(f"Email: **{u['email']}** | Phone: **{u['phone_number']}**")
+                                st.write(f"Month Present: **{u['present_days']}** | Absent: **{u['absent_days']}** | Attendance Rate: **{u['percentage']}%**")
+                                
+                                # Registered Facial Templates preview status
+                                with st.container(border=True):
+                                    st.markdown("##### 🔑 Registered Face ID Templates")
+                                    st.success("✅ Facial Recognition Templates Enrolled: 5/5 poses registered successfully")
+                                    st.caption("*Standard, Look Left, Look Right, Upward, Downward/Smile* templates cache is active.")
+                                
+                                # Action operations buttons
+                                act_col1, act_col2, act_col3, act_col4 = st.columns(4)
+                                with act_col1:
+                                    if u['role'] != "Admin":
+                                        if st.button("👑 Make Admin", key=f"btn_admin_{u['id']}"):
+                                            st.session_state.admin_confirm_action = {"id": u['id'], "name": u['name'], "action": "make_admin"}
+                                            st.rerun()
+                                with act_col2:
+                                    if u['role'] != "User":
+                                        if st.button("👤 Convert to User", key=f"btn_user_{u['id']}"):
+                                            st.session_state.admin_confirm_action = {"id": u['id'], "name": u['name'], "action": "convert_user"}
+                                            st.rerun()
+                                with act_col3:
+                                    if u['role'] != "Registered":
+                                        if st.button("📝 Convert to Reg (Pending)", key=f"btn_reg_{u['id']}"):
+                                            st.session_state.admin_confirm_action = {"id": u['id'], "name": u['name'], "action": "convert_registered"}
+                                            st.rerun()
+                                with act_col4:
+                                    if st.button("❌ Permanently Remove", key=f"btn_remove_{u['id']}"):
+                                        st.session_state.admin_confirm_action = {"id": u['id'], "name": u['name'], "action": "delete"}
+                                        st.rerun()
+                                        
+        with tab_admin_att:
+            st.markdown("### 🛡️ Administrator Attendance Console")
+            admin_stats = api.get_admin_attendance_stats()
+            
+            adm_col1, adm_col2, adm_col3, adm_col4 = st.columns(4)
+            with adm_col1:
+                st.markdown(f"<div class='metric-card'><p class='stat-label'>Current Month Rate</p><p class='stat-number'>{admin_stats.get('current_month_percentage')}%</p></div>", unsafe_allow_html=True)
+            with adm_col2:
+                st.markdown(f"<div class='metric-card'><p class='stat-label'>Before Month Rate</p><p class='stat-number'>{admin_stats.get('previous_month_percentage')}%</p></div>", unsafe_allow_html=True)
+            with adm_col3:
+                st.markdown(f"<div class='metric-card'><p class='stat-label'>Current Year Rate</p><p class='stat-number'>{admin_stats.get('current_year_percentage')}%</p></div>", unsafe_allow_html=True)
+            with adm_col4:
+                st.markdown(f"<div class='metric-card'><p class='stat-label'>Before Year Rate</p><p class='stat-number'>{admin_stats.get('previous_year_percentage')}%</p></div>", unsafe_allow_html=True)
+                
+            # Table removed to prevent duplication. Only one unified Today's Attendance Board is displayed in Overview tab.
+                
+        with tab_overview:
+            try:
+                overview = api.get_attendance_overview_stats()
+            except Exception as e:
+                st.error(f"Failed to load attendance overview: {e}")
+                overview = {}
+
+            summary = overview.get("summary_today", {})
+            
+            # 5 Clickable KPI Metric Button Cards (preserving layout size)
+            if "admin_selected_kpi" not in st.session_state:
+                st.session_state.admin_selected_kpi = None
+
+            m_col1, m_col2, m_col3, m_col4, m_col5 = st.columns(5)
+            with m_col1:
+                st.markdown("<style>div[class*='st-key-btn_kpi_total'] button { border-left-color: #3b82f6 !important; }</style>", unsafe_allow_html=True)
+                if st.button(f"👥 Total Users\n{summary.get('total_strength', 0)}", key="btn_kpi_total", use_container_width=True):
+                    st.session_state.admin_selected_kpi = "total_users" if st.session_state.admin_selected_kpi != "total_users" else None
+                    st.rerun()
+            with m_col2:
+                st.markdown("<style>div[class*='st-key-btn_kpi_present'] button { border-left-color: #10b981 !important; }</style>", unsafe_allow_html=True)
+                if st.button(f"✅ Present Today\n{summary.get('present_count', 0)}", key="btn_kpi_present", use_container_width=True):
+                    st.session_state.admin_selected_kpi = "present_today" if st.session_state.admin_selected_kpi != "present_today" else None
+                    st.rerun()
+            with m_col3:
+                st.markdown("<style>div[class*='st-key-btn_kpi_absent'] button { border-left-color: #ef4444 !important; }</style>", unsafe_allow_html=True)
+                if st.button(f"❌ Absent Today\n{summary.get('absent_count', 0)}", key="btn_kpi_absent", use_container_width=True):
+                    st.session_state.admin_selected_kpi = "absent_today" if st.session_state.admin_selected_kpi != "absent_today" else None
+                    st.rerun()
+            with m_col4:
+                st.markdown("<style>div[class*='st-key-btn_kpi_late'] button { border-left-color: #f59e0b !important; }</style>", unsafe_allow_html=True)
+                if st.button(f"⏰ Late Today\n{summary.get('late_count', 0)}", key="btn_kpi_late", use_container_width=True):
+                    st.session_state.admin_selected_kpi = "late_today" if st.session_state.admin_selected_kpi != "late_today" else None
+                    st.rerun()
+            with m_col5:
+                st.markdown("<style>div[class*='st-key-btn_kpi_pct'] button { border-left-color: #8b5cf6 !important; }</style>", unsafe_allow_html=True)
+                if st.button(f"📊 Attendance Rate\n{summary.get('total_attendance_pct', 0.0)}%", key="btn_kpi_pct", use_container_width=True):
+                    st.session_state.admin_selected_kpi = "attendance_pct" if st.session_state.admin_selected_kpi != "attendance_pct" else None
+                    st.rerun()
+
+            # Render the drill-down tables based on selected KPI
+            selected_kpi = st.session_state.get("admin_selected_kpi")
+            if selected_kpi:
+                import pandas as pd
+                status_board = overview.get("status_board", [])
+                
+                with st.container(border=True):
+                    if selected_kpi == "total_users":
+                        st.markdown("#### 👥 System Total Users")
+                        kpi_df = []
+                        for item in status_board:
+                            kpi_df.append({
+                                "Name": item["name"],
+                                "Email": item["email"],
+                                "Role": item["role"]
+                            })
+                        if kpi_df:
+                            st.dataframe(pd.DataFrame(kpi_df), use_container_width=True, hide_index=True)
+                        else:
+                            st.info("No users found.")
+                            
+                    elif selected_kpi == "present_today":
+                        st.markdown("#### ✅ Present Today (User / Admin)")
+                        kpi_df = []
+                        for item in status_board:
+                            if item["status"] in ("Present", "Late", "Half Day", "Something wrong"):
+                                kpi_df.append({
+                                    "Name": item["name"],
+                                    "Email": item["email"],
+                                    "Role": item["role"],
+                                    "Check-In": item["check_in"],
+                                    "Check-Out": item["check_out"],
+                                    "Status": item["status"]
+                                })
+                        if kpi_df:
+                            st.dataframe(pd.DataFrame(kpi_df), use_container_width=True, hide_index=True)
+                        else:
+                            st.info("No users present today.")
+                            
+                    elif selected_kpi == "absent_today":
+                        st.markdown("#### ❌ Absent Today (User / Admin)")
+                        kpi_df = []
+                        for item in status_board:
+                            if item["status"] == "Absent":
+                                kpi_df.append({
+                                    "Name": item["name"],
+                                    "Email": item["email"],
+                                    "Role": item["role"],
+                                    "Status": "Absent"
+                                })
+                        if kpi_df:
+                            st.dataframe(pd.DataFrame(kpi_df), use_container_width=True, hide_index=True)
+                        else:
+                            st.info("No users absent today.")
+                            
+                    elif selected_kpi == "late_today":
+                        st.markdown("#### ⏰ Late Check-Ins Today")
+                        kpi_df = []
+                        for item in status_board:
+                            if item["status"] == "Late":
+                                kpi_df.append({
+                                    "Name": item["name"],
+                                    "Email": item["email"],
+                                    "Role": item["role"],
+                                    "Check-In": item["check_in"],
+                                    "Status": "Late"
+                                })
+                        if kpi_df:
+                            st.dataframe(pd.DataFrame(kpi_df), use_container_width=True, hide_index=True)
+                        else:
+                            st.info("No late arrivals today.")
+                            
+                    elif selected_kpi == "attendance_pct":
+                        st.markdown("#### 📊 Monthly Attendance Percentage")
+                        top_rankings = overview.get("top_attendance", [])
+                        kpi_df = []
+                        for item in top_rankings:
+                            kpi_df.append({
+                                "Employee Name": item["name"],
+                                "Department": item["department"],
+                                "Attendance Rate": item["rate"],
+                                "Present Days": item["present_days"],
+                                "Late Days": item["late_days"]
+                            })
+                        if kpi_df:
+                            st.dataframe(pd.DataFrame(kpi_df), use_container_width=True, hide_index=True)
+                        else:
+                            st.info("No attendance percentage records found.")
+                    
+                    if st.button("Close Details List ✕", key="btn_close_kpi_details", type="primary"):
+                        st.session_state.admin_selected_kpi = None
+                        st.rerun()
+                
+            # Graph starts immediately below cards. Removed st.markdown("---") and headers.
+            filter_col1, filter_col2 = st.columns([3, 1])
+            with filter_col1:
+                st.write("")
+            with filter_col2:
+                period = st.selectbox("Filter by:", ["This Week", "This Month", "This Year"], index=1, key="graph_filter")
+            
+            try:
+                period_map = {"This Week": "week", "This Month": "month", "This Year": "year"}
+                graph_response = api.get_attendance_graph_data(period_map.get(period, "month"))
+                
+                if graph_response and "labels" in graph_response and len(graph_response["labels"]) > 0:
+                    import pandas as pd
+                    import altair as alt
+                    
+                    df = pd.DataFrame({
+                        "date": graph_response["labels"],
+                        "Present": graph_response["present"],
+                        "Absent": graph_response["absent"],
+                        "Late": graph_response["late"],
+                        "Half Day": graph_response.get("half_day", [0] * len(graph_response["labels"]))
+                    })
+                    
+                    # Smooth stacked area chart with rounded borders & Tailwind HSL colors
+                    area_chart = alt.Chart(df).transform_fold(
+                        ["Present", "Absent", "Late", "Half Day"],
+                        as_=["Status", "Count"]
+                    ).mark_area(opacity=0.6, interpolate='monotone').encode(
+                        x=alt.X("date:N", title="Date"),
+                        y=alt.Y("Count:Q", stack="zero", title="Count"),
+                        color=alt.Color("Status:N", scale=alt.Scale(
+                            domain=["Present", "Absent", "Late", "Half Day"],
+                            range=["#10b981", "#ef4444", "#f59e0b", "#3b82f6"]
+                        )),
+                        tooltip=["date:N", "Status:N", "Count:Q"]
+                    ).properties(
+                        height=250
+                    ).configure_view(
+                        strokeWidth=0,
+                        cornerRadius=8
+                    )
+                    
+                    st.altair_chart(area_chart, use_container_width=True)
+                else:
+                    st.info("No attendance trend data available for the selected period.")
+            except Exception as e:
+                st.warning(f"Could not load attendance trends: {e}")
+                
+
+            st.markdown("---")
+
+            st.markdown("### 🏆 Top Attendance Ranking (This Month)")
+            top_rankings = overview.get("top_attendance", [])
+            top_rankings_filtered = [r for r in top_rankings if r.get("department") != "Administration"]
+            
+            if not top_rankings_filtered:
+                st.info("No monthly rankings available for users.")
+            else:
+                html_table_rank = """<table style='width: 100%; border-collapse: collapse; margin-top: 10px; color: #1F2937; font-family: sans-serif;'>
+<thead>
+<tr style='background-color: #1F2937; color: #FFFFFF; text-align: left; font-weight: bold;'>
+<th style='padding: 10px; border: 1px solid #1F2937;'>Rank</th>
+<th style='padding: 10px; border: 1px solid #1F2937;'>Employee Name</th>
+<th style='padding: 10px; border: 1px solid #1F2937;'>Attendance %</th>
+<th style='padding: 10px; border: 1px solid #1F2937;'>Present Days</th>
+<th style='padding: 10px; border: 1px solid #1F2937;'>Late Days</th>
+</tr>
+</thead>
+<tbody>"""
+                for rank, item in enumerate(top_rankings_filtered, 1):
+                    html_table_rank += f"""<tr style='background-color: #FFFFFF; border-bottom: 1px solid #1F2937;'>
+<td style='padding: 10px; border: 1px solid #1F2937;'><b>{rank}</b></td>
+<td style='padding: 10px; border: 1px solid #1F2937;'><b>{item['name']}</b><br><span style='font-size: 0.8rem; color: #666666;'>{item['department']}</span></td>
+<td style='padding: 10px; border: 1px solid #1F2937;'>{item['rate']}</td>
+<td style='padding: 10px; border: 1px solid #1F2937;'>{item['present_days']}</td>
+<td style='padding: 10px; border: 1px solid #1F2937;'>{item['late_days']}</td>
+</tr>"""
+                html_table_rank += "</tbody></table>"
+                st.markdown(html_table_rank, unsafe_allow_html=True)
+                
+
+            st.markdown("---")
+
+            st.markdown("### 📅 Today's Attendance Board")
+            status_board = overview.get("status_board", [])
+            if not status_board:
+                st.info("No approved accounts found in system.")
+            else:
+                html_table = """<table style='width: 100%; border-collapse: collapse; margin-top: 10px; color: #1F2937; font-family: sans-serif;'>
+<thead>
+<tr style='background-color: #1F2937; color: #FFFFFF; text-align: left; font-weight: bold;'>
+<th style='padding: 10px; border: 1px solid #1F2937;'>Name</th>
+<th style='padding: 10px; border: 1px solid #1F2937;'>Email</th>
+<th style='padding: 10px; border: 1px solid #1F2937;'>Role</th>
+<th style='padding: 10px; border: 1px solid #1F2937;'>Check-In</th>
+<th style='padding: 10px; border: 1px solid #1F2937;'>Check-Out</th>
+<th style='padding: 10px; border: 1px solid #1F2937;'>Status</th>
+</tr>
+</thead>
+<tbody>"""
+                for item in status_board:
+                    status_text = item.get("status", "Absent")
+                    
+                    if status_text == "Present":
+                        status_badge = "<span style='background-color: #E8F5E9; color: #2E7D32; padding: 4px 8px; border-radius: 4px; font-weight: bold; font-size: 0.85rem;'>Present</span>"
+                    elif status_text == "Late":
+                        status_badge = "<span style='background-color: #FFF3E0; color: #E65100; padding: 4px 8px; border-radius: 4px; font-weight: bold; font-size: 0.85rem;'>Late</span>"
+                    elif status_text == "Half Day":
+                        status_badge = "<span style='background-color: #FFF3E0; color: #F57C00; padding: 4px 8px; border-radius: 4px; font-weight: bold; font-size: 0.85rem;'>Half Day</span>"
+                    elif status_text in ("Something wrong", "Somthing wrong"):
+                        status_badge = "<span style='background-color: #FFEBEE; color: #C62828; padding: 4px 8px; border-radius: 4px; font-weight: bold; font-size: 0.85rem;'>Something wrong</span>"
+                    else:  # Absent
+                        status_badge = "<span style='background-color: #FFEBEE; color: #C62828; padding: 4px 8px; border-radius: 4px; font-weight: bold; font-size: 0.85rem;'>Absent</span>"
+                        
+                    html_table += f"""<tr style='background-color: #FFFFFF; border-bottom: 1px solid #1F2937;'>
+<td style='padding: 10px; border: 1px solid #1F2937;'><b>{item['name']}</b></td>
+<td style='padding: 10px; border: 1px solid #1F2937;'>{item['email']}</td>
+<td style='padding: 10px; border: 1px solid #1F2937;'>{item['role']}</td>
+<td style='padding: 10px; border: 1px solid #1F2937;'>{item['check_in']}</td>
+<td style='padding: 10px; border: 1px solid #1F2937;'>{item['check_out']}</td>
+<td style='padding: 10px; border: 1px solid #1F2937;'>{status_badge}</td>
+</tr>"""
+                html_table += "</tbody></table>"
+                st.markdown(html_table, unsafe_allow_html=True)
+                
+                # Manual Attendance Override
+                st.write("")
+                with st.expander("✍️ Manual Attendance Override"):
+                    st.write("Over-write check-in or check-out stamps for any approved user:")
+                    try:
+                        all_users = api.get_admin_users_list()
+                        approved_users = [u for u in all_users if u["approval_status"] == "Approved"]
+                    except Exception:
+                        approved_users = []
+                        
+                    if not approved_users:
+                        st.info("No approved users available.")
+                    else:
+                        with st.form("manual_override_form"):
+                            override_user = st.selectbox(
+                                "Select Employee",
+                                options=approved_users,
+                                format_func=lambda x: f"{x['name']} ({x['email']})",
+                                key="override_user_select"
+                            )
+                            override_date = st.date_input("Date", value=datetime.today().date(), key="override_date_picker")
+                            
+                            col_ov1, col_ov2 = st.columns(2)
+                            with col_ov1:
+                                override_in = st.text_input("Check-In Time (HH:MM in 24h format, or '-')", value="09:00", key="override_check_in")
+                            with col_ov2:
+                                override_out = st.text_input("Check-Out Time (HH:MM in 24h format, or '-')", value="17:00", key="override_check_out")
+                                
+                            override_status = st.selectbox(
+                                "Status Override",
+                                ["Present", "Late", "Half Day", "Absent"],
+                                key="override_status_select"
+                            )
+                            
+                            submit_override = st.form_submit_button("💾 Apply Manual Override")
+                            if submit_override:
+                                try:
+                                    api.override_attendance(
+                                        user_id=override_user["id"],
+                                        date_str=str(override_date),
+                                        check_in=override_in,
+                                        check_out=override_out,
+                                        status=override_status
+                                    )
+                                    st.success(f"✅ Successfully overrode attendance for {override_user['name']}!")
+                                    time.sleep(1.0)
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Failed to override attendance: {e}")
+
+            st.markdown("---")
+
+            st.markdown("### 📸 Recent Scanner Activity")
+            recent_list = overview.get("recent_attendance", [])
+            if not recent_list:
+                st.info("No recent scans recorded today.")
+            else:
+                for item in recent_list:
+                    with st.container(border=True):
+                        r_img_col, r_content_col = st.columns([1, 7])
+                        with r_img_col:
+                            img_path = item.get("image")
+                            if img_path and Path(img_path).exists():
+                                st.image(img_path, width=42)
+                            else:
+                                st.markdown("<div style='font-size: 1.8rem; display: flex; align-items: center; justify-content: center; height: 42px; width: 42px; border: 1px solid #1F2937; border-radius: 4px;'>👤</div>", unsafe_allow_html=True)
+                        with r_content_col:
+                            card_html = f"""
+                            <div style="display: flex; align-items: center; justify-content: space-between; width: 100%; color: #1F2937; font-family: 'Inter', sans-serif; height: 42px;">
+                                <div style="min-width: 0; display: flex; flex-direction: column; justify-content: center; flex-grow: 1;">
+                                    <span style="font-weight: 700; font-size: 0.95rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-family: 'Outfit', sans-serif;">{item['name']}</span>
+                                    <span style="font-size: 0.8rem; color: #666666; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">ID: STU{100+item['user_id']}</span>
+                                </div>
+                                <div style="display: flex; align-items: center; flex-shrink: 0; margin-left: 12px; height: 100%;">
+                                    <span style="font-size: 0.85rem; color: #666666; margin-right: 12px; white-space: nowrap; font-family: 'Inter', sans-serif;">{item['time']}</span>
+                                    <span style="background-color: #E8F5E9; color: #2E7D32; padding: 4px 8px; border-radius: 4px; font-size: 0.85rem; font-weight: bold; white-space: nowrap; font-family: 'Outfit', sans-serif;">Present</span>
+                                </div>
+                            </div>
+                            """
+                            st.markdown(card_html, unsafe_allow_html=True)
+
+
+        with tab_audit:
+            st.markdown("### Admin Action Logs")
+            
+            st.markdown("#### 📜 Audit Logs")
+            audit_logs = api.get_audit_logs()
+            if not audit_logs:
+                st.info("No audit logs found.")
+            else:
+                st.table(audit_logs)
+                
+                # Print button to download PDF
+                try:
+                    pdf_bytes = generate_audit_pdf(audit_logs)
+                    st.download_button(
+                        label="🖨️ Print Audit Logs (PDF)",
+                        data=pdf_bytes,
+                        file_name="system_audit_logs.pdf",
+                        mime="application/pdf"
+                    )
+                except Exception as ex:
+                    st.error(f"Error generating PDF: {ex}")
+    except Exception as e:
+        st.error(f"Failed to load administrative console: {e}")
+
+# 7. USER PROFILE PAGE
+elif st.session_state.current_page == "Profile":
+    st.subheader("👤 Account Profile Details")
+    
+    try:
+        stats = api.get_user_dashboard_stats(st.session_state.user_id)
+        
+        # Check if face profile expired
+        if stats.get("needs_face_update"):
+            st.warning("⚠️ Your face profile was last updated more than 90 days ago. To maintain high recognition accuracy, please update your face profile now.")
+            if st.button("Update Face Profile Now", type="primary", key="btn_profile_face_update"):
+                st.session_state.update_face_pose_idx = 0
+                st.session_state.update_face_captures = {}
+                st.session_state.current_page = "Update Face Profile"
+                st.rerun()
+        
+        if st.session_state.get("editing_profile"):
+            with st.container(border=True):
+                st.markdown("### ✏️ Edit Profile Details")
+                with st.form("edit_profile_form"):
+                    new_name = st.text_input("Name", value=stats.get("name"))
+                    new_email = st.text_input("Email Address", value=stats.get("email"))
+                    new_phone = st.text_input("Phone Number", value=stats.get("phone_number"))
+                    new_department = st.text_input("Department", value=(stats.get("department") or "").upper(), placeholder="e.g. ENGINEERING, HR, SALES")
+                    new_department = new_department.upper() if new_department else ""  # Auto-capitalize
+                    
+                    new_photo = st.file_uploader("Upload New Profile Photo (Optional, Max 5MB)", type=["jpg", "jpeg", "png"])
+                    if new_photo is not None:
+                        if new_photo.size > 5 * 1024 * 1024:
+                            st.error("❌ File size exceeds the 5MB limit. Please select a smaller image.")
+                            new_photo = None
+                    
+                    st.text_input("System Role", value=st.session_state.user_role, disabled=True)
+                    st.text_input("Status", value=stats.get("approval_status"), disabled=True)
+                    
+                    btn_col1, btn_col2 = st.columns(2)
+                    with btn_col1:
+                        save_btn = st.form_submit_button("Save Changes", type="primary", use_container_width=True)
+                    with btn_col2:
+                        cancel_btn = st.form_submit_button("Cancel", use_container_width=True)
+                        
+                    if save_btn:
+                        if not new_name or not new_email or not new_phone:
+                            st.error("Name, Email, and Phone Number cannot be empty.")
+                        else:
+                            photo_bytes = None
+                            if new_photo is not None:
+                                photo_bytes = new_photo.read()
+                            try:
+                                api.update_profile(
+                                    user_id=st.session_state.user_id,
+                                    name=new_name,
+                                    email=new_email,
+                                    phone_number=new_phone,
+                                    department=new_department,
+                                    image_bytes=photo_bytes
+                                )
+                                st.session_state.username = new_name
+                                st.success("🎉 Profile updated successfully!")
+                                st.session_state.editing_profile = False
+                                time.sleep(1.5)
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Failed to update profile: {e}")
+                    if cancel_btn:
+                        st.session_state.editing_profile = False
+                        st.rerun()
+        else:
+            with st.container(border=True):
+                col_left, col_right = st.columns([2, 1])
+                
+                with col_left:
+                    st.markdown(f"### **{stats.get('name')}**")
+                    st.write(f"Email Address: **{stats.get('email')}**")
+                    st.write(f"Phone Number: **{stats.get('phone_number')}**")
+                    st.write(f"Department: **{stats.get('department') or 'Not set'}**")
+                    st.write(f"System Role: **{st.session_state.user_role}**")
+                    st.write(f"Status: **{stats.get('approval_status')}**")
+                    
+                    st.write("")
+                    if st.button("Update Profile", key="btn_trigger_profile_update", type="primary", use_container_width=True):
+                        st.session_state.editing_profile = True
+                        st.rerun()
+                        
+                with col_right:
+                    st.write("📷 **Profile Template**")
+                    profile_image_path = stats.get("profile_image")
+                    
+                    if profile_image_path and Path(profile_image_path).exists():
+                        st.image(str(profile_image_path), use_container_width=True, caption="Approved face template")
+                    else:
+                        st.markdown("""
+                        <div style='display: flex; flex-direction: column; align-items: center; justify-content: center; 
+                                    height: 180px; width: 100%; border: 2px dashed #cbd5e1; border-radius: 12px; background-color: #f8fafc; text-align: center;'>
+                            <span style='font-size: 3.5rem; color: #94a3b8;'>👤</span>
+                            <span style='font-size: 0.85rem; color: #64748b; font-weight: 500; padding: 0 5px;'>No approved profile image found</span>
+                        </div>
+                        """, unsafe_allow_html=True)
+        
+    except Exception as e:
+        st.error(f"Failed to fetch profile: {e}")
+
+# 8. UPDATE FACE PROFILE PAGE
+elif st.session_state.current_page == "Update Face Profile":
+    col_left, col_mid, col_right = st.columns([1, 1.8, 1])
+    with col_mid:
+        st.markdown("<h2 style='text-align: center; color: #1F2937; font-family: \"Outfit\", sans-serif; font-weight: 800;'>🔄 Update Face Profile</h2>", unsafe_allow_html=True)
+        
+        with st.container(border=True):
+            st.markdown("### 👤 Face Re-Enrollment Process")
+            st.markdown("Please align your face in front of the camera and perform the rotations as indicated below.")
+        
+            # Poses list we need to cycle
+            poses_cycle = ["front", "left", "right", "up", "down"]
+        
+            # Track index in state
+            if "update_face_pose_idx" not in st.session_state:
+                st.session_state.update_face_pose_idx = 0
+                st.session_state.update_face_captures = {}
+            
+            current_pose = poses_cycle[st.session_state.update_face_pose_idx]
+        
+            pose_instructions = {
+                "front": "Look directly straight at the camera.",
+                "left": "Rotate your face towards the LEFT side (profile).",
+                "right": "Rotate your face towards the RIGHT side (profile).",
+                "up": "Tilt your face slightly UPWARDS.",
+                "down": "Tilt your face slightly DOWNWARDS."
+            }
+        
+            instruction_placeholder = st.empty()
+            progress_placeholder = st.empty()
+        
+            instruction_placeholder.info(f"👉 **Current Action**: **{current_pose.upper()}** - {pose_instructions[current_pose]}")
+            progress_placeholder.write(f"Progress: **{st.session_state.update_face_pose_idx} / 5** poses captured.")
+        
+            # Enrollment Camera display loop
+            frame_placeholder = st.empty()
+            status_placeholder = st.empty()
+        
+            start_capture = st.button("Start Re-Enrollment Camera")
+        
+            if start_capture:
+                cap = cv2.VideoCapture(0)
+                if not cap.isOpened():
+                    st.error("Cannot access camera.")
+                else:
+                    last_call = 0.0
+                    try:
+                        while st.session_state.update_face_pose_idx < len(poses_cycle):
+                            ret, frame = cap.read()
+                            if not ret:
+                                time.sleep(0.05)
+                                continue
+                            
+                            frame = cv2.flip(frame, 1)
+                            clean_frame = frame.copy()
+                        
+                            # Highlight guide boxes
+                            h, w, _ = frame.shape
+                            cv2.rectangle(frame, (int(w*0.3), int(h*0.2)), (int(w*0.7), int(h*0.8)), (255, 255, 255), 2)
+                            cv2.putText(frame, f"POSE: {current_pose.upper()}", (int(w*0.3), int(h*0.2)-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                        
+                            frame_placeholder.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), channels="RGB")
+                        
+                            # Try sending frame for pose validation
+                            now_time = time.time()
+                            if now_time - last_call >= 0.8:
+                                last_call = now_time
+                            
+                                _, img_encoded = cv2.imencode('.jpg', clean_frame)
+                                image_bytes = img_encoded.tobytes()
+                            
+                                try:
+                                    status_placeholder.info(f"Scanning for {current_pose.upper()} pose...")
+                                    api.upload_enrollment_pose(st.session_state.user_id, current_pose, image_bytes)
+                                
+                                    # Success! Save frame and step index
+                                    st.session_state.update_face_captures[current_pose] = True
+                                    st.session_state.update_face_pose_idx += 1
+                                
+                                    # Update progress dynamically
+                                    progress_placeholder.write(f"Progress: **{st.session_state.update_face_pose_idx} / 5** poses captured.")
+                                
+                                    status_placeholder.success(f"✓ Captured {current_pose.upper()}!")
+                                    time.sleep(1.0)
+                                
+                                    if st.session_state.update_face_pose_idx < len(poses_cycle):
+                                        current_pose = poses_cycle[st.session_state.update_face_pose_idx]
+                                        # Update instruction dynamically
+                                        instruction_placeholder.info(f"👉 **Current Action**: **{current_pose.upper()}** - {pose_instructions[current_pose]}")
+                                    else:
+                                        break
+                                except Exception as e:
+                                    # Show error description returned by pose classifier
+                                    status_placeholder.warning(str(e))
+                                
+                            time.sleep(0.03)
+                    finally:
+                        cap.release()
+                        frame_placeholder.empty()
+                
+                    # Check if all completed
+                    if st.session_state.update_face_pose_idx >= 5:
+                        status_placeholder.info("Finalizing face profiles...")
+                        try:
+                            api.complete_enrollment(st.session_state.user_id)
+                            st.success("🎉 Face profile updated successfully!")
+                            
+                            # Clean up states
+                            if "update_face_pose_idx" in st.session_state:
+                                del st.session_state.update_face_pose_idx
+                            if "update_face_captures" in st.session_state:
+                                del st.session_state.update_face_captures
+                            
+                            time.sleep(2.0)
+                            # Redirect back to User Dashboard or Admin Dashboard depending on role
+                            if st.session_state.user_role == "Admin":
+                                st.session_state.current_page = "Admin Dashboard"
+                            else:
+                                st.session_state.current_page = "User Dashboard"
+                            st.rerun()
+                        except Exception as e:
+                            st.error(str(e))
+                        
+            if st.button("Cancel & Return to Dashboard"):
+                if "update_face_pose_idx" in st.session_state:
+                    del st.session_state.update_face_pose_idx
+                if "update_face_captures" in st.session_state:
+                    del st.session_state.update_face_captures
+                if st.session_state.user_role == "Admin":
+                    st.session_state.current_page = "Admin Dashboard"
+                else:
+                    st.session_state.current_page = "User Dashboard"
+                st.rerun()
+
+# ─────────────────────────────────────────
+# 10. REPORT PAGE  (Admin only)
+# ─────────────────────────────────────────
+elif st.session_state.current_page == "Report":
+    from fpdf import FPDF
+    import io
+
+    col_left, col_mid, col_right = st.columns([1, 2.5, 1])
+    with col_mid:
+        st.markdown(
+            "<h2 style='text-align:center;font-family:Outfit,sans-serif;font-weight:800;"
+            "margin-top:1.5rem;margin-bottom:0.5rem;'>📋 Attendance Report</h2>",
+            unsafe_allow_html=True
+        )
+        st.markdown(
+            "<p style='text-align:center;color:#555;margin-bottom:1.5rem;'>"
+            "Select a date to view and download the full attendance record.</p>",
+            unsafe_allow_html=True
+        )
+
+        with st.container(border=True):
+            # ── Date picker + Year/Month selectors ─────────────────────────
+            st.markdown("### 📅 Select Date")
+            import calendar
+            from calendar import monthrange
+
+            today = datetime.today()
+            years = list(range(today.year - 5, today.year + 3))
+            cols = st.columns([1, 1, 3])
+            with cols[0]:
+                selected_year = st.selectbox("Year", years, index=years.index(today.year), label_visibility="collapsed")
+            with cols[1]:
+                month_names = list(calendar.month_name)[1:]
+                selected_month_idx = st.selectbox("Month", month_names, index=today.month - 1, label_visibility="collapsed")
+                selected_month = month_names.index(selected_month_idx) + 1
+            with cols[2]:
+                # default day: keep current day when selecting current month/year, otherwise day=1
+                default_day = today.day if (selected_year == today.year and selected_month == today.month) else 1
+                # ensure day is valid for the selected month/year
+                max_day = monthrange(selected_year, selected_month)[1]
+                default_day = min(default_day, max_day)
+                selected_date = st.date_input(
+                    "Choose a date",
+                    value=datetime(selected_year, selected_month, default_day).date(),
+                    label_visibility="collapsed"
+                )
+
+            fetch_btn = st.button("🔍 View Report", type="primary", use_container_width=True)
+
+        # Bulk Export Date Range
+        st.write("---")
+        with st.container(border=True):
+            st.markdown("### 📥 Bulk Master CSV Export")
+            st.write("Extract complete HR attendance spreadsheet for a date range:")
+            
+            col_b1, col_b2 = st.columns(2)
+            with col_b1:
+                start_range = st.date_input("Start Date", value=today.date() - timedelta(days=7), key="bulk_start_range")
+            with col_b2:
+                end_range = st.date_input("End Date", value=today.date(), key="bulk_end_range")
+                
+            if st.button("📊 Generate Bulk CSV", use_container_width=True, key="btn_generate_bulk_csv"):
+                try:
+                    with st.spinner("Compiling database records..."):
+                        bulk_records = api.get_attendance_report_range(start_range.strftime("%Y-%m-%d"), end_range.strftime("%Y-%m-%d"))
+                    
+                    if bulk_records:
+                        import pandas as pd
+                        bulk_df = pd.DataFrame(bulk_records)
+                        csv_data = bulk_df.to_csv(index=False).encode('utf-8')
+                        st.download_button(
+                            label="📥 Download Master CSV Report",
+                            data=csv_data,
+                            file_name=f"master_attendance_report_{start_range}_to_{end_range}.csv",
+                            mime="text/csv",
+                            key="btn_download_bulk_csv"
+                        )
+                        st.success("✅ CSV generated successfully! Click the download button above.")
+                    else:
+                        st.warning("No records found in this range.")
+                except Exception as e:
+                    st.error(f"Failed to generate bulk report: {e}")
+
+        if fetch_btn or st.session_state.get("report_date_loaded"):
+            # Store the date so the report stays visible after fetch
+            if fetch_btn:
+                st.session_state.report_date_loaded = selected_date.strftime("%Y-%m-%d")
+            
+            date_str = st.session_state.report_date_loaded
+
+            try:
+                records = api.get_attendance_report(date_str)
+            except Exception as e:
+                st.error(f"❌ Failed to load report: {e}")
+                records = []
+
+            if records is not None:
+                display_date = datetime.strptime(date_str, "%Y-%m-%d").strftime("%d %B %Y")
+
+                # ── Summary counts ──────────────────────────────────────
+                total     = len(records)
+                present   = sum(1 for r in records if "Present" in r.get("status", ""))
+                absent    = sum(1 for r in records if r.get("status") == "Absent")
+                not_leave = sum(1 for r in records if "Not Leave" in r.get("status", ""))
+
+                st.markdown(f"### 📊 Report for **{display_date}**")
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Total Members", total)
+                m2.metric("Present", present)
+                m3.metric("Absent", absent)
+
+                st.write("")
+
+                # ── Table ────────────────────────────────────────────────
+                if records:
+                    # Colour the status column
+                    def status_badge(s):
+                        if s == "Present":
+                            return "🟢 Present"
+                        elif s == "Absent":
+                            return "🔴 Absent"
+                        else:
+                            return f"⚪ {s}"
+
+                    table_rows = []
+                    for idx, r in enumerate(records, 1):
+                        table_rows.append({
+                            "#":         idx,
+                            "Name":      r.get("name", "-"),
+                            "Role":      r.get("role", "-"),
+                            "Check In":  r.get("check_in", "-"),
+                            "Check Out": r.get("check_out", "-"),
+                            "Status":    status_badge(r.get("status", "-"))
+                        })
+
+                    st.dataframe(
+                        table_rows,
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+                    # ── PDF Generation ───────────────────────────────────
+                    st.write("")
+                    st.markdown("---")
+                    st.markdown("#### ⬇️ Download Report")
+
+                    def generate_pdf(records, date_label, summary):
+                        pdf = FPDF()
+                        pdf.set_auto_page_break(auto=True, margin=15)
+                        pdf.add_page()
+
+                        # Header
+                        pdf.set_font("Helvetica", "B", 18)
+                        pdf.cell(0, 10, "Face AI Attendance System", ln=True, align="C")
+                        pdf.set_font("Helvetica", "", 12)
+                        pdf.cell(0, 8, f"Attendance Report  -  {date_label}", ln=True, align="C")
+                        pdf.ln(4)
+
+                        # Divider
+                        pdf.set_draw_color(0, 0, 0)
+                        pdf.set_line_width(0.5)
+                        pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+                        pdf.ln(4)
+
+                        # Summary box
+                        pdf.set_font("Helvetica", "B", 11)
+                        pdf.set_fill_color(240, 240, 240)
+                        pdf.cell(45, 8, f"Total: {summary['total']}", border=1, fill=True)
+                        pdf.cell(45, 8, f"Present: {summary['present']}", border=1, fill=True)
+                        pdf.cell(45, 8, f"Absent: {summary['absent']}", border=1, fill=True)
+                        pdf.cell(45, 8, f"Not Left: {summary['not_leave']}", border=1, fill=True, ln=True)
+                        pdf.ln(4)
+
+                        # Table header
+                        col_w = [10, 55, 22, 28, 28, 40]
+                        headers = ["#", "Name", "Role", "Check In", "Check Out", "Status"]
+                        pdf.set_font("Helvetica", "B", 10)
+                        pdf.set_fill_color(30, 30, 30)
+                        pdf.set_text_color(255, 255, 255)
+                        for w, h in zip(col_w, headers):
+                            pdf.cell(w, 8, h, border=1, fill=True, align="C")
+                        pdf.ln()
+
+                        # Table rows
+                        pdf.set_font("Helvetica", "", 9)
+                        pdf.set_text_color(0, 0, 0)
+                        for idx, r in enumerate(records, 1):
+                            # Alternate row fill
+                            if idx % 2 == 0:
+                                pdf.set_fill_color(245, 245, 245)
+                                fill = True
+                            else:
+                                fill = False
+
+                            status_raw = r.get("status", "-")
+                            # Plain status text for PDF (no emoji)
+                            if status_raw == "Present":
+                                status_txt = "Present"
+                            elif status_raw == "Absent":
+                                status_txt = "Absent"
+                            else:
+                                status_txt = status_raw
+
+                            row_data = [
+                                str(idx),
+                                r.get("name", "-")[:28],
+                                r.get("role", "-"),
+                                r.get("check_in", "-"),
+                                r.get("check_out", "-"),
+                                status_txt
+                            ]
+                            for w, val in zip(col_w, row_data):
+                                pdf.cell(w, 7, val, border=1, fill=fill, align="C")
+                            pdf.ln()
+
+                        # Footer
+                        pdf.ln(6)
+                        pdf.set_font("Helvetica", "I", 8)
+                        pdf.set_text_color(120, 120, 120)
+                        pdf.cell(0, 6, f"Generated on {datetime.now().strftime('%d %b %Y, %I:%M %p')}  |  Face AI Attendance System", align="C")
+
+                        return pdf.output()
+
+                    summary = {
+                        "total":     total,
+                        "present":   present,
+                        "absent":    absent,
+                        "not_leave": not_leave
+                    }
+
+                    pdf_bytes = generate_pdf(records, display_date, summary)
+                    filename  = f"attendance_report_{date_str}.pdf"
+
+                    st.download_button(
+                        label="⬇️  Download PDF Report",
+                        data=bytes(pdf_bytes),
+                        file_name=filename,
+                        mime="application/pdf",
+                        type="primary",
+                        use_container_width=True
+                    )
+
+                else:
+                    st.info("No Records Found")
+

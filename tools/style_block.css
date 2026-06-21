@@ -1,0 +1,554 @@
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap');
+    
+    html, body, [class*="css"] {
+        font-family: 'Inter', sans-serif;
+        overflow-x: hidden !important;
+    }
+    
+    .stApp,
+    [data-testid="stAppViewContainer"],
+    [data-testid="stHeader"],
+    .main,
+    .stMain,
+    .stAppViewContainer,
+    div[data-testid="stAppViewBlockContainer"] {
+        background-color: #FFFFFF !important;
+        background-image: none !important;
+        color: #000000 !important;
+    }
+
+    [data-testid="stHeader"] * {
+        color: #000000 !important;
+        fill: #000000 !important;
+    }
+    
+    /* Header Card styling */
+    .main-header {
+        background: #000000 !important;
+        padding: 2rem !important;
+        border-radius: 12px !important;
+        color: #FFFFFF !important;
+        text-align: center !important;
+        margin-bottom: 2rem !important;
+        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15) !important;
+        border: 1px solid #FFFFFF !important;
+    }
+    
+    .main-header h1 {
+        font-family: 'Outfit', sans-serif !important;
+        margin: 0 !important;
+        font-weight: 800 !important;
+        font-size: 2.4rem !important;
+        color: #FFFFFF !important;
+    }
+    
+    .main-header p {
+        margin: 8px 0 0 0 !important;
+        font-size: 1.1rem !important;
+        opacity: 0.95 !important;
+        font-weight: 400 !important;
+        color: #FFFFFF !important;
+    }
+    
+    /* Section Headers */
+    h1, h2, h3, h4, h5, h6 {
+        font-family: 'Outfit', sans-serif !important;
+        color: #000000 !important;
+        font-weight: 700 !important;
+    }
+    
+    /* Metrics blocks */
+    .metric-card {
+        background-color: #FFFFFF !important;
+        padding: 1.5rem !important;
+        border-radius: 10px !important;
+        border: 1px solid #000000 !important;
+        border-left: 6px solid #000000 !important;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05) !important;
+        margin-bottom: 1rem !important;
+    }
+    
+    .stat-number {
+        font-family: 'Outfit', sans-serif !important;
+        font-size: 2.2rem !important;
+        font-weight: 800 !important;
+        color: #000000 !important;
+        margin: 0 0 4px 0 !important;
+    }
+    
+    .stat-label {
+        font-family: 'Outfit', sans-serif !important;
+        font-size: 0.85rem !important;
+        color: #000000 !important;
+        text-transform: uppercase !important;
+        font-weight: 700 !important;
+        margin: 0 !important;
+    }
+    
+    /* Button overrides are moved to the end of the stylesheet to ensure they take precedence over all container rules */
+    
+    /* Sidebar customization (white background -> black text) */
+    [data-testid="stSidebar"],
+    [data-testid="stSidebarUserContent"],
+    div[data-testid="stSidebarCollapseButton"] {
+        background-color: #FFFFFF !important;
+        border-right: 1px solid #000000 !important;
+        color: #000000 !important;
+    }
+    
+    [data-testid="stSidebar"] * {
+        color: #000000 !important;
+    }
+    
+    [data-testid="stSidebar"] button {
+        background-color: #000000 !important;
+        color: #FFFFFF !important;
+        border: 1px solid #000000 !important;
+    }
+    
+    [data-testid="stSidebar"] button * {
+        color: #FFFFFF !important;
+        background-color: transparent !important;
+        border: none !important;
+        box-shadow: none !important;
+    }
+    
+    [data-testid="stSidebar"] button:hover {
+        background-color: #FFFFFF !important;
+        color: #000000 !important;
+        border: 1px solid #000000 !important;
+    }
+    
+    [data-testid="stSidebar"] button:hover * {
+        color: #000000 !important;
+    }
+    
+    /* Cards and content blocks */
+    .content-box {
+        background-color: #FFFFFF !important;
+        padding: 1.8rem !important;
+        border-radius: 10px !important;
+        border: 1px solid #000000 !important;
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05) !important;
+        margin-bottom: 1.5rem !important;
+        color: #000000 !important;
+    }
+    
+    /* Verification Statuses */
+    .status-badge {
+        padding: 6px 14px !important;
+        border-radius: 20px !important;
+        font-weight: 700 !important;
+        font-size: 0.85rem !important;
+        display: inline-block !important;
+        border: 1px solid #000000 !important;
+    }
+    
+    .status-pending {
+        background-color: #FFFFFF !important;
+        color: #000000 !important;
+    }
+    
+    .status-approved {
+        background-color: #28a745 !important;
+        color: #FFFFFF !important;
+        border-color: #28a745 !important;
+    }
+    
+    .status-rejected {
+        background-color: #FFFFFF !important;
+        color: #000000 !important;
+        border: 1px dashed #000000 !important;
+    }
+
+    /* Force input widget labels and input texts to be clearly visible */
+    div[data-testid="stWidgetLabel"] p, label, .stWidgetLabel p {
+        color: #000000 !important;
+        font-weight: 700 !important;
+        font-size: 0.95rem !important;
+    }
+    
+    div[data-baseweb="input"] {
+        background-color: #FFFFFF !important;
+        border: 1px solid #000000 !important;
+        border-radius: 8px !important;
+    }
+    
+    div[data-baseweb="input"] input {
+        color: #000000 !important;
+        background-color: transparent !important;
+        -webkit-text-fill-color: #000000 !important;
+        text-transform: none !important;
+    }
+    
+    div[data-baseweb="input"]:focus-within {
+        border-color: #000000 !important;
+        box-shadow: 0 0 0 1px #000000 !important;
+    }
+    
+    div[data-baseweb="select"] > div {
+        background-color: #FFFFFF !important;
+        border: 1px solid #000000 !important;
+        border-radius: 8px !important;
+    }
+    
+    div[data-baseweb="select"] * {
+        color: #000000 !important;
+    }
+    
+    div[data-baseweb="select"] > div:focus-within {
+        border-color: #000000 !important;
+        box-shadow: 0 0 0 1px #000000 !important;
+    }
+    
+    /* Style base web select dropdown list menu */
+    div[role="listbox"] {
+        background-color: #FFFFFF !important;
+        border: 1px solid #000000 !important;
+    }
+    div[role="listbox"] * {
+        color: #000000 !important;
+        background-color: #FFFFFF !important;
+    }
+    div[role="listbox"] li:hover {
+        background-color: #000000 !important;
+        color: #FFFFFF !important;
+    }
+    div[role="listbox"] li:hover * {
+        background-color: #000000 !important;
+        color: #FFFFFF !important;
+    }
+    
+    /* Placeholder styling */
+    ::placeholder {
+        color: #666666 !important;
+        opacity: 1 !important;
+    }
+    :-ms-input-placeholder {
+        color: #666666 !important;
+    }
+    ::-ms-input-placeholder {
+        color: #666666 !important;
+    }
+
+    /* Style the border container and ensure it is white in all Streamlit emotion cache variants */
+    div[data-testid="stVerticalBlockBorder"],
+    div.stVerticalBlockBorder,
+    [data-testid="stVerticalBlock"] > div[style*="border"],
+    .st-emotion-cache-12w0qpk,
+    .st-emotion-cache-1y4p8pa {
+        background-color: #FFFFFF !important;
+        padding: 1.8rem !important;
+        border-radius: 10px !important;
+        border: 1px solid #000000 !important;
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05) !important;
+        margin-bottom: 1.5rem !important;
+        color: #000000 !important;
+    }
+    
+    /* Enforce body text colors in markdown lists and paragraphs */
+    div[data-testid="stMarkdown"] p, div[data-testid="stMarkdown"] li {
+        color: #000000 !important;
+        line-height: 1.6 !important;
+    }
+
+    /* Streamlit expander text colors */
+    div[data-testid="stExpander"] {
+        background-color: #FFFFFF !important;
+        border: 1px solid #000000 !important;
+        border-radius: 8px !important;
+    }
+    div[data-testid="stExpander"] details summary {
+        background-color: #FFFFFF !important;
+        color: #000000 !important;
+    }
+    div[data-testid="stExpander"] details summary * {
+        color: #000000 !important;
+        font-weight: 700 !important;
+    }
+    div[data-testid="stExpander"] details div {
+        background-color: #FFFFFF !important;
+        color: #000000 !important;
+    }
+    div[data-testid="stExpander"] details div * {
+        color: #000000 !important;
+    }
+
+    /* Streamlit tabs text colors (Active: Black bg + White text, Inactive: White bg + Black text) */
+    div[data-testid="stTabs"] {
+        background-color: #FFFFFF !important;
+    }
+    button[data-baseweb="tab"] {
+        background-color: #FFFFFF !important;
+        color: #000000 !important;
+        border: 1px solid transparent !important;
+        transition: all 0.3s ease !important;
+    }
+    button[data-baseweb="tab"] p {
+        color: #000000 !important;
+        font-weight: 500 !important;
+    }
+    button[data-baseweb="tab"]:hover {
+        border-bottom: 2px solid #000000 !important;
+    }
+    button[data-baseweb="tab"][aria-selected="true"] {
+        background-color: #000000 !important;
+        color: #FFFFFF !important;
+        border: 1px solid #000000 !important;
+        border-radius: 4px 4px 0 0 !important;
+    }
+    button[data-baseweb="tab"][aria-selected="true"] p {
+        color: #FFFFFF !important;
+        font-weight: 800 !important;
+    }
+
+    /* Streamlit table alignment and readable fonts */
+    div[data-testid="stTable"] th {
+        background-color: #000000 !important;
+        color: #FFFFFF !important;
+        font-weight: 700 !important;
+        font-family: 'Outfit', sans-serif !important;
+        border-bottom: 2px solid #000000 !important;
+    }
+    
+    div[data-testid="stTable"] td {
+        color: #000000 !important;
+        border-bottom: 1px solid #000000 !important;
+        background-color: #FFFFFF !important;
+    }
+
+    /* Alert styling overrides to match Black & White design (white box, black text/borders) */
+    div[data-testid="stAlert"] {
+        background-color: #FFFFFF !important;
+        color: #000000 !important;
+        border: 1px solid #000000 !important;
+    }
+    div[data-testid="stAlert"] * {
+        color: #000000 !important;
+    }
+
+    /* Style the header container only, preventing parent blocks from turning black */
+    div[data-testid="stVerticalBlock"] div[data-testid="stVerticalBlock"]:has(#header-nav-marker) {
+        background-color: #000000 !important; /* Pure black background */
+        background-image: none !important;
+        padding: 1.8rem !important;
+        border-radius: 12px !important;
+        color: #FFFFFF !important;
+        text-align: center !important;
+        margin-bottom: 2rem !important;
+        box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2) !important;
+        border: 1px solid #FFFFFF !important;
+    }
+
+    /* Make title inside header white */
+    div[data-testid="stVerticalBlock"] div[data-testid="stVerticalBlock"]:has(#header-nav-marker) h1 {
+        color: #FFFFFF !important;
+        text-align: center !important;
+        margin-top: 0 !important;
+        margin-bottom: 0.8rem !important;
+        font-weight: 700 !important;
+        font-size: 2.2rem !important;
+    }
+
+    /* Style buttons inside header to look premium and distinct */
+    div[data-testid="stVerticalBlock"] div[data-testid="stVerticalBlock"]:has(#header-nav-marker) button {
+        background-color: transparent !important;
+        color: #FFFFFF !important;
+        border: 1px solid transparent !important;
+        font-weight: 500 !important;
+        border-radius: 20px !important; /* Rounded pill style */
+        padding: 0.4rem 1.2rem !important;
+        transition: all 0.3s ease !important;
+        width: 100% !important;
+        box-shadow: none !important;
+        white-space: nowrap !important;
+    }
+
+    div[data-testid="stVerticalBlock"] div[data-testid="stVerticalBlock"]:has(#header-nav-marker) button:hover {
+        color: #000000 !important;
+        background-color: #FFFFFF !important;
+        border: 1px solid #FFFFFF !important;
+    }
+
+    /* Style the active button inside the header as a white pill with black text */
+    div[data-testid="stVerticalBlock"] div[data-testid="stVerticalBlock"]:has(#header-nav-marker) button[data-testid="baseButton-primary"] {
+        background-color: #FFFFFF !important;
+        color: #000000 !important;
+        font-weight: 600 !important;
+        border: 1px solid #FFFFFF !important;
+    }
+
+    div[data-testid="stVerticalBlock"] div[data-testid="stVerticalBlock"]:has(#header-nav-marker) button[data-testid="baseButton-primary"]:hover {
+        background-color: #EEEEEE !important;
+        color: #000000 !important;
+    }
+
+    /* Center and format the columns and prevent mobile stacking */
+    div[data-testid="stVerticalBlock"] div[data-testid="stVerticalBlock"]:has(#header-nav-marker) div[data-testid="stHorizontalBlock"] {
+        display: flex !important;
+        flex-direction: row !important;
+        flex-wrap: wrap !important;
+        justify-content: space-evenly !important;
+        align-items: center !important;
+        gap: 12px !important;
+        width: 100% !important;
+    }
+
+    div[data-testid="stVerticalBlock"] div[data-testid="stVerticalBlock"]:has(#header-nav-marker) div[data-testid="stHorizontalBlock"] > div {
+        width: auto !important;
+        flex: 1 1 auto !important;
+        max-width: max-content !important;
+        display: flex !important;
+        justify-content: center !important;
+        align-items: center !important;
+        padding: 0 !important;
+    }
+
+    /* Streamlit progress bar override to match B&W */
+    div[data-testid="stProgress"] > div {
+        background-color: #FFFFFF !important;
+        border: 1px solid #000000 !important;
+        height: 12px !important;
+        border-radius: 6px !important;
+    }
+    div[data-testid="stProgress"] > div > div {
+        background-color: #000000 !important;
+        height: 10px !important;
+        border-radius: 5px !important;
+    }
+
+    /* Mobile responsiveness adjustments */
+    @media (max-width: 768px) {
+        div[data-testid="stVerticalBlock"] div[data-testid="stVerticalBlock"]:has(#header-nav-marker) h1 {
+            font-size: 1.6rem !important;
+        }
+        
+        div[data-testid="stVerticalBlock"] div[data-testid="stVerticalBlock"]:has(#header-nav-marker) button {
+            padding: 0.3rem 0.8rem !important;
+            font-size: 0.85rem !important;
+        }
+        
+        div[data-testid="stVerticalBlock"] div[data-testid="stVerticalBlock"]:has(#header-nav-marker) div[data-testid="stHorizontalBlock"] {
+            gap: 8px !important;
+            justify-content: center !important;
+        }
+    }
+
+    /* =========================================================================
+       BUTTON STYLING OVERRIDES (Placed at the end of stylesheet for highest precedence)
+       ========================================================================= */
+    /* 1. Global Button Styles */
+    div[data-testid*="Button"] button[data-testid*="baseButton"],
+    div.stButton button,
+    div.stFormSubmitButton button,
+    button[data-testid*="baseButton"] {
+        background-color: #000000 !important;
+        background: #000000 !important;
+        color: #FFFFFF !important;
+        font-weight: 600 !important;
+        border-radius: 12px !important;
+        border: 1px solid #000000 !important;
+        padding: 0.6rem 1.6rem !important;
+        transition: all 0.3s ease !important;
+        width: 100% !important;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.08) !important;
+        opacity: 1 !important;
+    }
+    
+    div[data-testid*="Button"] button[data-testid*="baseButton"]:hover,
+    div.stButton button:hover,
+    div.stFormSubmitButton button:hover,
+    button[data-testid*="baseButton"]:hover {
+        background-color: #FFFFFF !important;
+        background: #FFFFFF !important;
+        color: #000000 !important;
+        border: 1px solid #000000 !important;
+        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.2) !important;
+        transform: translateY(-1px) !important;
+    }
+
+    /* 2. Global Button Children Styles (Transparent backgrounds & White text) */
+    button[data-testid*="baseButton"] *,
+    button[data-testid*="baseButton"] * *,
+    button[data-testid*="baseButton"] p,
+    button[data-testid*="baseButton"] span,
+    button[data-testid*="baseButton"] div {
+        background-color: transparent !important;
+        background: transparent !important;
+        color: #FFFFFF !important;
+        border: none !important;
+        border-color: transparent !important;
+        box-shadow: none !important;
+        padding: 0 !important;
+        margin: 0 !important;
+    }
+    
+    button[data-testid*="baseButton"]:hover *,
+    button[data-testid*="baseButton"]:hover * *,
+    button[data-testid*="baseButton"]:hover p,
+    button[data-testid*="baseButton"]:hover span,
+    button[data-testid*="baseButton"]:hover div {
+        color: #000000 !important;
+        background-color: transparent !important;
+        background: transparent !important;
+        border: none !important;
+        border-color: transparent !important;
+        box-shadow: none !important;
+        padding: 0 !important;
+        margin: 0 !important;
+    }
+
+    /* 3. Expander Button Specificity Overrides */
+    div[data-testid*="expander"] div[data-testid*="Button"] button[data-testid*="baseButton"],
+    div.stExpander div.stButton button,
+    details div.stButton button,
+    div[data-testid*="expander"] button,
+    details button {
+        background-color: #000000 !important;
+        background: #000000 !important;
+        color: #FFFFFF !important;
+        border: 1px solid #000000 !important;
+        border-radius: 12px !important;
+    }
+    
+    div[data-testid*="expander"] div[data-testid*="Button"] button[data-testid*="baseButton"] *,
+    div[data-testid*="expander"] div[data-testid*="Button"] button[data-testid*="baseButton"] * *,
+    div[data-testid*="expander"] div[data-testid*="Button"] button[data-testid*="baseButton"] p,
+    div[data-testid*="expander"] div[data-testid*="Button"] button[data-testid*="baseButton"] span,
+    div[data-testid*="expander"] div[data-testid*="Button"] button[data-testid*="baseButton"] div,
+    div.stExpander div.stButton button *,
+    details div.stButton button *,
+    div[data-testid*="expander"] button *,
+    details button * {
+        background-color: transparent !important;
+        background: transparent !important;
+        color: #FFFFFF !important;
+        border: none !important;
+        border-color: transparent !important;
+        box-shadow: none !important;
+        padding: 0 !important;
+        margin: 0 !important;
+    }
+    
+    div[data-testid*="expander"] div[data-testid*="Button"] button[data-testid*="baseButton"]:hover,
+    div.stExpander div.stButton button:hover,
+    details div.stButton button:hover,
+    div[data-testid*="expander"] button:hover,
+    details button:hover {
+        background-color: #FFFFFF !important;
+        background: #FFFFFF !important;
+        color: #000000 !important;
+        border: 1px solid #000000 !important;
+    }
+    
+    div[data-testid*="expander"] div[data-testid*="Button"] button[data-testid*="baseButton"]:hover *,
+    div[data-testid*="expander"] div[data-testid*="Button"] button[data-testid*="baseButton"]:hover * *,
+    div[data-testid*="expander"] div[data-testid*="Button"] button[data-testid*="baseButton"]:hover p,
+    div[data-testid*="expander"] div[data-testid*="Button"] button[data-testid*="baseButton"]:hover span,
+    div[data-testid*="expander"] div[data-testid*="Button"] button[data-testid*="baseButton"]:hover div,
+    div.stExpander div.stButton button:hover *,
+    details div.stButton button:hover *,
+    div[data-testid*="expander"] button:hover *,
+    details button:hover * {
+        color:
