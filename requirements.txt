@@ -14,5 +14,4 @@ PyJWT>=2.8
 pillow>=10.3
 mediapipe>=0.10.0
 insightface>=1.0.1
-retina-face>=0.0.18
 onnxruntime>=1.20.0
